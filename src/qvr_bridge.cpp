@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "qvr_bridge.hpp"
-#include <qiyu/device/a081_camera_timing.hpp>
+#include <xr/device/a081_camera_timing.hpp>
 
 #include <algorithm>
 #include <cerrno>

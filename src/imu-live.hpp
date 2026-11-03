@@ -5,10 +5,10 @@
 // imu-input-contract.json and start-contract.json for the recovered wire ABI.
 #include "qvr_bridge.hpp"
 #include "a081_pose_output.hpp"
-#include <qiyu/device/a081_camera_capture.hpp>
-#include <qiyu/device/a081_camera_groups.hpp>
+#include <xr/device/a081_camera_capture.hpp>
+#include <xr/device/a081_camera_groups.hpp>
 #include "a081_tracking_server.hpp"
-#include <qiyu/device/a081_controller_frame_export.hpp>
+#include <xr/device/a081_controller_frame_export.hpp>
 
 #include <algorithm>
 #include <array>

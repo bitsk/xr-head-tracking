@@ -1,0 +1,27 @@
+Source: xr-head-tracking
+Section: misc
+Priority: optional
+Maintainer: openKylin XR SIG <xr@lists.openkylin.top>
+Build-Depends: debhelper-compat (= 13), cmake, ninja-build, g++, libxr-device-dev, libxr-hexagonrpc-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Vcs-Git: https://gitee.com/bigbits/xr-head-tracking.git
+Vcs-Browser: https://gitee.com/bigbits/xr-head-tracking
+
+Package: xr-head-tracking
+Architecture: arm64
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: XR headset tracking producer and private plugin
+ Independently maintained XR component for openKylin integration.
+
+Package: xr-head-tracking-tools
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: XR head tracking observation tools
+ Independently maintained XR component for openKylin integration.
+
+Package: libxr-head-dev
+Architecture: all
+Depends: ${misc:Depends}
+Description: XR head pose protocol headers
+ Independently maintained XR component for openKylin integration.

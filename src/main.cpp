@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "qvr_bridge.hpp"
 #include "imu-live.hpp"
-#include <qiyu/device/a081_camera_capture.hpp>
+#include <xr/device/a081_camera_capture.hpp>
 
 #include <atomic>
 #include <cerrno>

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "target": "Qiyu MIX A081, Debian qcom-see IIO with original SEE firmware and registry",
+  "target": "XR MIX A081, Debian qcom-see IIO with original SEE firmware and registry",
   "status": "offline_evidence_confirmed_relative_axes",
   "purpose": "Real IIO samples into QVR external-sensor SDK; no synthetic input, hardware access, kernel change or bridge change performed for this investigation.",
   "result": {
