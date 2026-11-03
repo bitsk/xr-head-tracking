@@ -30,3 +30,5 @@ DSP runtime 和型号默认 config6 已归档到独立公开 [xr-vendor-assets](
 当前迁移不自动启用竞争采集、切换活动运行时或写设备启动分区；已有验证基线继续保留。
 
 构建依赖通过已安装的 `xr-kernel-uapi-dev` 和 `libxr-device-dev` 提供；可用 CMAKE_PREFIX_PATH 选择开发包前缀。
+
+FastRPC 客户端由独立 xr-hexagonrpc 仓库维护，通过 libxr-hexagonrpc-dev 的 XRHexagonRPC::client 导入，避免在跟踪仓库复制第二份实现。

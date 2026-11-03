@@ -28,8 +28,3 @@ set_target_properties(a081-tracking-observe PROPERTIES OUTPUT_NAME xr-head-obser
 install(TARGETS a081-tracking-observe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/xr DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-install(TARGETS a081-qvr-stock-live-stream RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/xr/head-tracking)
-install(TARGETS a081-qvr-client-live-stream LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/xr/head-tracking)
-set_target_properties(a081-tracking-observe PROPERTIES OUTPUT_NAME xr-head-observe)
-install(TARGETS a081-tracking-observe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(DIRECTORY include/xr DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
