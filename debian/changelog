@@ -1,3 +1,9 @@
+xr-head-tracking (0.1.2) unstable; urgency=medium
+
+  * Build the shared tracking producer with optional stereo passthrough capture.
+
+ -- bits <bigbits@hackx.cc>  Thu, 12 Nov 2026 17:14:26 +0800
+
 xr-head-tracking (0.1.1) unstable; urgency=medium
 
   * Preserve production v2 motion stream and share post-QVR hand frames.
