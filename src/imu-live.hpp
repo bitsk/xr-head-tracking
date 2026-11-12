@@ -608,6 +608,12 @@ public:
         packet.pose_boottime_ns = pose.timestamp_ns;
         std::copy(pose.rotation_xyzw.begin(), pose.rotation_xyzw.end(), packet.rotation_xyzw);
         std::copy(pose.translation.begin(), pose.translation.end(), packet.translation);
+        std::copy(pose.angular_s.begin(), pose.angular_s.end(), packet.angular_s);
+        std::copy(pose.angular_b.begin(), pose.angular_b.end(), packet.angular_b);
+        std::copy(pose.angular_bdt.begin(), pose.angular_bdt.end(), packet.angular_bdt);
+        std::copy(pose.angular_bdt2.begin(), pose.angular_bdt2.end(), packet.angular_bdt2);
+        std::copy(pose.translation_s.begin(), pose.translation_s.end(), packet.translation_s);
+        std::copy(pose.translation_b.begin(), pose.translation_b.end(), packet.translation_b);
         packet.pose_quality = pose.pose_quality;
         packet.tracking_state = pose.tracking_state;
         packet.warning_flags = pose.warning_flags;
@@ -674,6 +680,7 @@ public:
     }
     // finish() joins capture before groups and the exporter are destroyed.
     controller::FrameExporter controller_export;
+    controller::FrameExporter hand_export{"A081_HAND_INPUT_SOCKET"};
     camera::FrameGroups groups;
     const std::uint64_t exposure_ns;
     std::atomic<bool> done{false}, abort{false};
@@ -754,7 +761,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                 if (!pose_ring.copy_after_notification(sample.time, packet)) { ok = false; break; }
                 ++pose_reads.at(packet.pose_read_status);
                 stream.publish(packet);
-                if (visual) visual->controller_export.pose(packet);
+                if (visual) { visual->controller_export.pose(packet); visual->hand_export.pose(packet); }
             }
             if (notified == 1 || notified % 128 == 0) {
                 std::lock_guard<std::mutex> log(camera::output_mutex);
@@ -824,6 +831,10 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                 }
                 ++camera_calls; last_camera_time = group.submit_boottime_ns;
                 last_qvr_exposure_start = qvr_time.exposure_start_boottime_ns;
+                // This same group's synchronous QVR camera RPC returned OK.
+                // It is not a global DSP-idle barrier and does not wait for
+                // hand inference; future original IMU/camera calls continue.
+                visual->hand_export.frame(group);
             }
         }
     }
