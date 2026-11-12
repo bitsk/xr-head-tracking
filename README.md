@@ -3,7 +3,7 @@
 QVR/CDSP 头部跟踪与姿态接口。
 
 
-构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://gitee.com/bigbits/openkylin-xr-docs)。
+构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://github.com/bitsk/openkylin-xr-docs)。
 
 ## 构建
 
@@ -21,7 +21,7 @@ cmake --build build -j4
 
 ## 原厂运行资源
 
-DSP runtime 和型号默认 config6 已归档到独立公开 [xr-vendor-assets](https://gitee.com/bigbits/xr-vendor-assets) Release。通过 xr-image-tools 的 `tools/vendor.py fetch` 下载并校验后，缓存里的 `qvr/runtime/qcom/` 提供 DSP 文件，`qvr/config/config6.xml` 提供型号默认配置；rootfs 安装目标记录在 vendor.lock.json 中。每台设备的相机校准独立提供，不从其他设备的 persist 复制。正常使用不依赖整份原厂镜像。
+DSP runtime 和型号默认 config6 已归档到独立公开 [xr-vendor-assets](https://github.com/bitsk/xr-vendor-assets) Release。通过 xr-image-tools 的 `tools/vendor.py fetch` 下载并校验后，缓存里的 `qvr/runtime/qcom/` 提供 DSP 文件，`qvr/config/config6.xml` 提供型号默认配置；rootfs 安装目标记录在 vendor.lock.json 中。每台设备的相机校准独立提供，不从其他设备的 persist 复制。正常使用不依赖整份原厂镜像。
 
 ## openKylin 打包
 

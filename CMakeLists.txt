@@ -28,3 +28,5 @@ set_target_properties(a081-tracking-observe PROPERTIES OUTPUT_NAME xr-head-obser
 install(TARGETS a081-tracking-observe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/xr DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
+
+install(PROGRAMS tools/audit-motion.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME xr-head-audit-motion)
