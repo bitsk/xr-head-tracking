@@ -510,6 +510,7 @@ public:
     }
     bool save_stopped_snapshot()
     {
+        if (!xr_recording_enabled() || !xr_recording_room(std::getenv("A081_QVR_OUTPUT_DIR"))) return true;
         if (spec_.id != head::RingId::pose && spec_.id != head::RingId::dl_prediction) return true;
         const char *directory = std::getenv("A081_QVR_OUTPUT_DIR");
         if (!directory || directory[0] != '/') {
@@ -768,7 +769,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                 stream.publish(packet);
                 if (visual) { visual->controller_export.pose(packet); visual->hand_export.pose(packet); }
             }
-            if (notified == 1 || notified % 128 == 0) {
+            if (xr_diagnostic_logs_enabled() && (notified == 1 || notified % 128 == 0)) {
                 std::lock_guard<std::mutex> log(camera::output_mutex);
                 std::cout << "stage=imu_publish rc=0 count=" << notified << " gyro_ns=" << sample.time
                           << " accel_ns=" << latest_accel.time << " slot=" << (notified - 1) % 8
@@ -831,18 +832,18 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                     static_cast<std::int32_t>(group.frames[0].image.sequence),
                     static_cast<std::int32_t>(group.frames[2].image.sequence));
                 last_camera_rpc_ns = boottime_ns() - camera_begin_ns;
-                report("camera_frame", r, "submit_boottime_ns=" + std::to_string(group.submit_boottime_ns) +
+                if (!r || xr_diagnostic_logs_enabled()) report("camera_frame", r, "submit_boottime_ns=" + std::to_string(group.submit_boottime_ns) +
                        " rpc_wall_ns=" + std::to_string(last_camera_rpc_ns) +
                        " tracking_frame=" + std::to_string(group.frames[0].image.sequence) +
                        " controller_frame=" + std::to_string(group.frames[2].image.sequence));
                 if (!r) { ok = false; break; }
-                if (camera_calls == 0) {
+                if (camera_calls == 0 && xr_recording_enabled() && xr_recording_room(std::getenv("A081_QVR_OUTPUT_DIR"))) {
                     const std::string output = std::getenv("A081_QVR_OUTPUT_DIR");
                     for (unsigned slot = 0; slot < 4; ++slot)
                         camera::save_bytes(output + "/camera-slot" + std::to_string(slot) +
                                            "-first-submitted.y8", group.frames[slot].image.y8);
                 }
-                {
+                if (xr_diagnostic_logs_enabled()) {
                     std::lock_guard<std::mutex> log(camera::output_mutex);
                     std::cout << "stage=camera_group_submitted submit_boottime_ns=" << group.submit_boottime_ns;
                     for (unsigned slot = 0; slot < 4; ++slot) {

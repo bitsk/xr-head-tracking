@@ -18,6 +18,7 @@ foreach(kind executable plugin)
   target_link_libraries(${target} PRIVATE XRDevice::abi XRHexagonRPC::client pthread dl)
 endforeach()
 add_executable(a081-tracking-observe src/tracking-observe.c)
+target_link_libraries(a081-tracking-observe PRIVATE XRDevice::api)
 target_include_directories(a081-tracking-observe PRIVATE include)
 
 target_compile_definitions(a081-tracking-observe PRIVATE _GNU_SOURCE)

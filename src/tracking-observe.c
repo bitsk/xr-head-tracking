@@ -2,6 +2,7 @@
 // Device-side read-only subscriber; writes only packets received from the producer.
 #include <xr/head/production-v2/a081_tracking_client.h>
 #include <fcntl.h>
+#include <xr/device/a081_recording.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
@@ -22,12 +23,13 @@ static uint64_t now_ns(void)
 int main(int argc, char **argv)
 {
 	if (argc < 3 || argc > 4) {
-		fprintf(stderr, "Usage: a081-tracking-observe /absolute/socket /absolute/new-output.bin [seconds:0..450; 0 until source close]\n");
+		fprintf(stderr, "Usage: a081-tracking-observe /absolute/socket /absolute/new-status.json (set XR_DIAGNOSTIC_RAW=1 for capped binary capture) [seconds:0..450; 0 until source close]\n");
 		return 2;
 	}
 	char *end = NULL;
 	long seconds = argc == 4 ? strtol(argv[3], &end, 10) : 10;
 	if (seconds < 0 || seconds > 450 || (end && *end) || argv[2][0] != '/') return 2;
+	int raw_recording = xr_recording_enabled();
 	int output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (output < 0) { perror("output"); return 1; }
 	struct sigaction sa = {0}; sa.sa_handler = stop;
@@ -37,7 +39,7 @@ int main(int argc, char **argv)
 	uint64_t missing_pose = 0, invalid_clock = 0, stale = 0, gaps = 0;
 	uint64_t session = 0, sequence = 0, last_gyro = 0, first_gyro = 0;
 	int fd = -1, failed = 0;
-	uint64_t segment_bytes = 0, completed_segments = 0;
+	uint64_t segment_bytes = 0;
 	const uint64_t segment_limit = (UINT64_C(32) * 1024 * 1024 / sizeof(struct a081_tracking_packet)) * sizeof(struct a081_tracking_packet);
 	while (!interrupted && (!seconds || now_ns() < deadline)) {
 		if (fd < 0) {
@@ -62,25 +64,28 @@ int main(int argc, char **argv)
 		if (session && packet.sequence != sequence + 1) gaps += packet.sequence - sequence - 1;
 		session = packet.session_id; sequence = packet.sequence; last_gyro = packet.gyro_boottime_ns;
 		if (!first_gyro) first_gyro = last_gyro;
-		if (!seconds && segment_bytes >= segment_limit) {
-			char retained[PATH_MAX];
-			int length = snprintf(retained, sizeof(retained), "%s.%s", argv[2], completed_segments ? "previous" : "first");
-			if (length < 0 || (size_t)length >= sizeof(retained) || close(output) != 0 || rename(argv[2], retained) != 0) { failed = 1; break; }
-			output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-			if (output < 0) { failed = 1; break; }
-			++completed_segments; segment_bytes = 0;
-			fprintf(stderr, "raw_packet_rotation completed_segments=%" PRIu64 " retained=first+previous+current limit=%" PRIu64 " next_sequence=%" PRIu64 "\n", completed_segments, segment_limit, packet.sequence);
-		}
-		const unsigned char *bytes = (const unsigned char *)&packet;
-		size_t written = 0;
-		while (written < sizeof(packet)) {
-			ssize_t n = write(output, bytes + written, sizeof(packet) - written);
-			if (n < 0 && errno == EINTR) continue;
-			if (n <= 0) { failed = 1; break; }
-			written += (size_t)n;
-		}
-		if (failed) break;
-		++packets; segment_bytes += sizeof(packet);
+        if (!raw_recording && !packets && output >= 0) {
+            const char marker[] = "{\"first_packet_received\":true,\"raw_recording\":false}\n";
+            if (write(output, marker, sizeof(marker)-1) != sizeof(marker)-1) failed = 1;
+            close(output); output = -1;
+        }
+        if (raw_recording && output >= 0) {
+            if (segment_bytes + sizeof(packet) > segment_limit ||
+                (packets % 500 == 0 && !xr_recording_room(argv[2]))) {
+                close(output); output = -1;
+            } else {
+                const unsigned char *bytes = (const unsigned char *)&packet;
+                size_t written = 0;
+                while (written < sizeof(packet)) {
+                    ssize_t n = write(output, bytes + written, sizeof(packet) - written);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) { close(output); output = -1; break; }
+                    written += (size_t)n;
+                }
+                segment_bytes += written;
+            }
+        }
+        ++packets;
 		uint64_t now = now_ns();
 		if (!(packet.flags & A081_TRACKING_CLOCK)) ++invalid_clock;
 		else if (packet.sample_monotonic_ns > now || now - packet.sample_monotonic_ns >= A081_TRACKING_MAX_AGE_NS) ++stale;
@@ -91,7 +96,7 @@ int main(int argc, char **argv)
 		} else ++missing_pose;
 	}
 	if (fd >= 0) close(fd);
-	if (close(output) != 0) failed = 1;
+	if (output >= 0 && close(output) != 0) failed = 1;
 	printf("{\"packets\":%" PRIu64 ",\"raw_pose\":%" PRIu64 ",\"quality_zero\":%" PRIu64
 	       ",\"quality_one\":%" PRIu64 ",\"missing_pose\":%" PRIu64 ",\"invalid_clock\":%" PRIu64
 	       ",\"stale\":%" PRIu64 ",\"sequence_gaps\":%" PRIu64 ",\"session_id\":%" PRIu64
