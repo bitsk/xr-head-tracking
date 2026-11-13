@@ -2,7 +2,7 @@ Source: xr-head-tracking
 Section: misc
 Priority: optional
 Maintainer: openKylin XR SIG <xr@lists.openkylin.top>
-Build-Depends: debhelper-compat (= 13), cmake, ninja-build, g++, libxr-device-dev (>= 0.1.2), libxr-hexagonrpc-dev
+Build-Depends: debhelper-compat (= 13), cmake, ninja-build, g++, libxr-device-dev (>= 0.1.4), libxr-hexagonrpc-dev
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Vcs-Git: https://github.com/bitsk/xr-head-tracking.git
