@@ -1,3 +1,10 @@
+xr-head-tracking (0.1.6) unstable; urgency=medium
+
+  * Retain IMU age and camera RPC telemetry with the production schedule.
+  * Keep bounded catch-up opt-in until motion comparison verifies its benefit.
+
+ -- bits <bigbits@hackx.cc>  Fri, 13 Nov 2026 17:37:36 +0800
+
 xr-head-tracking (0.1.5) unstable; urgency=medium
 
   * Bound IMU catch-up before serial camera calls and expose callback timing.

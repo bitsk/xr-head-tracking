@@ -703,7 +703,10 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
     std::uint64_t notified = 0, skipped = 0, first = 0, last = 0;
     std::uint64_t camera_calls = 0, last_camera_time = 0;
     std::uint64_t last_qvr_exposure_start = 0, camera_short_skipped = 0, camera_rate_skipped = 0;
-    const bool imu_catchup = std::getenv("XR_HEAD_DISABLE_IMU_CATCHUP") == nullptr;
+    // Motion A/B validation is still required: retain the production schedule
+    // by default while exposing timing telemetry for subsequent diagnosis.
+    const char *catchup_value = std::getenv("XR_HEAD_IMU_CATCHUP");
+    const bool imu_catchup = catchup_value && std::string(catchup_value) == "1";
     std::uint64_t catchup_started_ns = 0, imu_deferrals = 0, last_camera_rpc_ns = 0;
     std::array<std::uint64_t, 5> pose_reads{};
     bool ok = true;
