@@ -8,6 +8,11 @@
 #include <xr/device/a081_camera_capture.hpp>
 #include <xr/device/a081_camera_groups.hpp>
 #include "a081_tracking_server.hpp"
+#include <xr/head/production-v2/a081_imu_history.h>
+#include <condition_variable>
+#include <memory>
+#include <sys/vfs.h>
+#include <linux/magic.h>
 #include <xr/device/a081_controller_frame_export.hpp>
 
 #include <algorithm>
@@ -657,6 +662,93 @@ private:
     bool have_baseline_{}, retained_{};
 };
 
+// One IIO owner drains sensors independently of the serialized OEM RPC loop.
+// The OEM still receives every ordered sample; the presentation path can read
+// the real gyro history while camera_frame_from_sof is blocked in FastRPC.
+class LiveImuReader {
+public:
+    ~LiveImuReader() { stop(); }
+    bool start(IioStream &accel, IioStream &gyro, const std::array<int, 3> &axes, const char *path)
+    {
+        if (std::strncmp(path, "/run/", 5)) return false;
+        const char *group = std::getenv("A081_QVR_IMU_READER_GID");
+        char *end = nullptr;
+        unsigned long gid = group ? std::strtoul(group, &end, 10) : 0;
+        if (!group || !*group || *end || gid > UINT32_MAX) return false;
+        fd_ = ::open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd_ < 0) return false;
+        path_ = path;
+        struct statfs fs{};
+        if (fstatfs(fd_, &fs) || fs.f_type != TMPFS_MAGIC ||
+            ftruncate(fd_, sizeof(a081_imu_history)) || fchown(fd_, geteuid(), gid) || fchmod(fd_, 0640)) return false;
+        void *mapping = mmap(nullptr, sizeof(a081_imu_history), PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (mapping == MAP_FAILED) return false;
+        history_ = static_cast<a081_imu_history *>(mapping);
+        a081_imu_store(&history_->magic, A081_IMU_HISTORY_MAGIC);
+        worker_ = std::thread([this, &accel, &gyro, axes] {
+            while (!stop_.load()) {
+                pollfd descriptors[2]{{accel.fd(), POLLIN, 0}, {gyro.fd(), POLLIN, 0}};
+                const int ready = poll(descriptors, 2, 10);
+                if (ready < 0 && errno == EINTR) continue;
+                if (ready < 0) { fail(); break; }
+                if (!ready) continue;
+                std::vector<Sample> batch;
+                bool ok = true;
+                for (unsigned i=0;i<2;++i) {
+                    if (descriptors[i].revents & (POLLERR|POLLHUP|POLLNVAL)) { ok=false; break; }
+                    if ((descriptors[i].revents & POLLIN) && !(i ? gyro : accel).read_batch(batch, axes)) { ok=false; break; }
+                }
+                if (!ok) { fail(); break; }
+                for (const auto &sample : batch) if (sample.gyro) {
+                    const auto before=TrackingServer::now(CLOCK_MONOTONIC);
+                    const auto boot=TrackingServer::now(CLOCK_BOOTTIME);
+                    const auto after=TrackingServer::now(CLOCK_MONOTONIC);
+                    if (before && after>=before && after-before<=A081_TRACKING_MAX_BRACKET_NS &&
+                        boot>=sample.time && boot-sample.time<A081_TRACKING_MAX_AGE_NS) {
+                        const auto mono=before+(after-before)/2;
+                        if (mono>boot-sample.time) a081_imu_append(history_,mono-(boot-sample.time),sample.value.data());
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (queue_.size()+batch.size()>1024) { failed_=true; wake_.notify_all(); break; }
+                    queue_.insert(queue_.end(),batch.begin(),batch.end());
+                }
+                wake_.notify_one();
+            }
+        });
+        return true;
+    }
+    bool take(std::vector<Sample> &batch)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait_for(lock,std::chrono::milliseconds(20),[this] { return failed_ || !queue_.empty(); });
+        if (failed_) return false;
+        batch.assign(queue_.begin(),queue_.end()); queue_.clear();
+        return true;
+    }
+    bool pending() { std::lock_guard<std::mutex> lock(mutex_); return !queue_.empty(); }
+    void stop()
+    {
+        stop_.store(true);
+        if (worker_.joinable()) worker_.join();
+        if (history_) { a081_imu_store(&history_->magic,0); munmap(history_,sizeof(a081_imu_history)); history_=nullptr; }
+        if (fd_>=0) { ::close(fd_); fd_=-1; }
+        if (!path_.empty()) { unlink(path_.c_str()); path_.clear(); }
+    }
+private:
+    void fail() { std::lock_guard<std::mutex> lock(mutex_); failed_=true; wake_.notify_all(); }
+    int fd_=-1;
+    std::string path_;
+    a081_imu_history *history_=nullptr;
+    std::atomic<bool> stop_{false};
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<Sample> queue_;
+    bool failed_=false;
+};
+
 class VisualInput {
 public:
     explicit VisualInput(std::uint64_t exposure_ns)
@@ -709,6 +801,14 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
     const char *catchup_value = std::getenv("XR_HEAD_IMU_CATCHUP");
     const bool imu_catchup = catchup_value && std::string(catchup_value) == "1";
     std::uint64_t catchup_started_ns = 0, imu_deferrals = 0, last_camera_rpc_ns = 0;
+    std::unique_ptr<LiveImuReader> reader;
+    const char *history_path = std::getenv("A081_QVR_IMU_HISTORY");
+    if (visual && history_path && *history_path) {
+        reader = std::make_unique<LiveImuReader>();
+        if (!reader->start(accel, gyro, axes, history_path)) {
+            report("imu_reader_start", failure(errno ? errno : EINVAL)); return false;
+        }
+    }
     std::array<std::uint64_t, 5> pose_reads{};
     bool ok = true;
     while (!interrupted && boottime_ns() < deadline && notified < max_notifications) {
@@ -719,20 +819,25 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
             // obscures the quality of the last camera-fed records.
             if (visual->groups.empty()) break;
         }
-        pollfd descriptors[2]{{accel.fd(), POLLIN, 0}, {gyro.fd(), POLLIN, 0}};
-        const int ready = poll(descriptors, 2, 20);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            report("iio_poll", failure(errno)); ok = false; break;
-        }
-        if (ready == 0) continue;
         std::vector<Sample> batch;
         batch.reserve(128);
-        for (unsigned i = 0; i < 2; ++i) {
-            if (descriptors[i].revents & (POLLERR | POLLHUP | POLLNVAL)) { ok = false; break; }
-            if ((descriptors[i].revents & POLLIN) && !(i ? gyro : accel).read_batch(batch, axes)) { ok = false; break; }
+        if (reader) {
+            if (!reader->take(batch)) { ok=false; break; }
+            if (batch.empty()) continue;
+        } else {
+            pollfd descriptors[2]{{accel.fd(), POLLIN, 0}, {gyro.fd(), POLLIN, 0}};
+            const int ready = poll(descriptors, 2, 20);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                report("iio_poll", failure(errno)); ok=false; break;
+            }
+            if (!ready) continue;
+            for (unsigned i=0;i<2;++i) {
+                if (descriptors[i].revents & (POLLERR|POLLHUP|POLLNVAL)) { ok=false; break; }
+                if ((descriptors[i].revents & POLLIN) && !(i ? gyro : accel).read_batch(batch, axes)) { ok=false; break; }
+            }
+            if (!ok) break;
         }
-        if (!ok) break;
         std::stable_sort(batch.begin(), batch.end(), [](const Sample &a, const Sample &b) {
             return a.time == b.time ? a.gyro < b.gyro : a.time < b.time;
         });
@@ -790,7 +895,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
             const auto now = boottime_ns();
             pollfd pending{gyro.fd(), POLLIN, 0};
             if (imu_catchup && last && now > last + 3000000ULL &&
-                poll(&pending, 1, 0) > 0 && (pending.revents & POLLIN)) {
+                (reader ? reader->pending() : poll(&pending, 1, 0) > 0 && (pending.revents & POLLIN))) {
                 if (!catchup_started_ns) catchup_started_ns = now;
                 if (now - catchup_started_ns < 8000000ULL) { ++imu_deferrals; continue; }
             }
@@ -862,6 +967,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
             }
         }
     }
+    if (reader) reader->stop();
     {
     std::lock_guard<std::mutex> log(camera::output_mutex);
     std::cout << "stage=imu_input_summary elapsed_ns=" << boottime_ns() - start
