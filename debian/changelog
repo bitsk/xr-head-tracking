@@ -1,3 +1,9 @@
+xr-head-tracking (0.1.5) unstable; urgency=medium
+
+  * Bound IMU catch-up before serial camera calls and expose callback timing.
+
+ -- bits <bigbits@hackx.cc>  Fri, 13 Nov 2026 17:17:39 +0800
+
 xr-head-tracking (0.1.4) unstable; urgency=medium
 
   * Restore continuous observation and bounded packet rotation used by native sessions.

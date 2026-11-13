@@ -703,6 +703,8 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
     std::uint64_t notified = 0, skipped = 0, first = 0, last = 0;
     std::uint64_t camera_calls = 0, last_camera_time = 0;
     std::uint64_t last_qvr_exposure_start = 0, camera_short_skipped = 0, camera_rate_skipped = 0;
+    const bool imu_catchup = std::getenv("XR_HEAD_DISABLE_IMU_CATCHUP") == nullptr;
+    std::uint64_t catchup_started_ns = 0, imu_deferrals = 0, last_camera_rpc_ns = 0;
     std::array<std::uint64_t, 5> pose_reads{};
     bool ok = true;
     while (!interrupted && boottime_ns() < deadline && notified < max_notifications) {
@@ -769,11 +771,26 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                           << " accel_ns=" << latest_accel.time << " slot=" << (notified - 1) % 8
                           << " gyro=" << sample.value[0] << ',' << sample.value[1] << ',' << sample.value[2]
                           << " accel=" << latest_accel.value[0] << ',' << latest_accel.value[1] << ',' << latest_accel.value[2]
+                          << " batch_samples=" << batch.size() << " sample_age_ns=" << boottime_ns() - sample.time
+                          << " last_camera_rpc_ns=" << last_camera_rpc_ns << " imu_deferrals=" << imu_deferrals
                           << " position_valid=not_evaluated" << std::endl;
             }
         }
         if (!ok) break;
         if (visual) {
+            // Camera RPC and IMU notifications must stay serialized. A camera
+            // call can leave several IMU samples queued; processing the batch
+            // takes more time, during which still newer samples arrive. Drain
+            // those before starting another camera RPC, with a bounded budget
+            // so a saturated IMU caller cannot starve visual localization.
+            const auto now = boottime_ns();
+            pollfd pending{gyro.fd(), POLLIN, 0};
+            if (imu_catchup && last && now > last + 3000000ULL &&
+                poll(&pending, 1, 0) > 0 && (pending.revents & POLLIN)) {
+                if (!catchup_started_ns) catchup_started_ns = now;
+                if (now - catchup_started_ns < 8000000ULL) { ++imu_deferrals; continue; }
+            }
+            catchup_started_ns = 0;
             camera::FrameGroup group;
             if (visual->groups.take(last, group)) {
                 head::Bytes tracking, controllers;
@@ -805,11 +822,14 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                 }
                 // Only this thread invokes QVR, after IMU has reached the
                 // camera time. Capture workers only publish bounded real data.
+                const auto camera_begin_ns = boottime_ns();
                 const auto r = module.camera_frame_from_sof(group.frames[0].timing.sof_boottime_ns,
                     camera::frame_exposure_ns(group.frames[0].timing, visual->exposure_ns), tracking, controllers,
                     static_cast<std::int32_t>(group.frames[0].image.sequence),
                     static_cast<std::int32_t>(group.frames[2].image.sequence));
+                last_camera_rpc_ns = boottime_ns() - camera_begin_ns;
                 report("camera_frame", r, "submit_boottime_ns=" + std::to_string(group.submit_boottime_ns) +
+                       " rpc_wall_ns=" + std::to_string(last_camera_rpc_ns) +
                        " tracking_frame=" + std::to_string(group.frames[0].image.sequence) +
                        " controller_frame=" + std::to_string(group.frames[2].image.sequence));
                 if (!r) { ok = false; break; }
@@ -847,6 +867,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
               << " first_gyro_ns=" << first << " last_gyro_ns=" << last
               << " interrupted=" << interrupted << " camera_rpc_success=" << camera_calls
               << " camera_short_skipped=" << camera_short_skipped << " camera_rate_skipped=" << camera_rate_skipped
+              << " imu_catchup=" << imu_catchup << " imu_deferrals=" << imu_deferrals
               << " last_camera_submit_ns=" << last_camera_time << " visual_6dof=not_validated" << std::endl;
     }
     accel.report_rate();
