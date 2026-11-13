@@ -3,6 +3,7 @@
 #include <xr/head/production-v2/a081_tracking_client.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -21,12 +22,12 @@ static uint64_t now_ns(void)
 int main(int argc, char **argv)
 {
 	if (argc < 3 || argc > 4) {
-		fprintf(stderr, "Usage: a081-tracking-observe /absolute/socket /absolute/new-output.bin [seconds:1..60]\n");
+		fprintf(stderr, "Usage: a081-tracking-observe /absolute/socket /absolute/new-output.bin [seconds:0..450; 0 until source close]\n");
 		return 2;
 	}
 	char *end = NULL;
 	long seconds = argc == 4 ? strtol(argv[3], &end, 10) : 10;
-	if (seconds < 1 || seconds > 60 || (end && *end) || argv[2][0] != '/') return 2;
+	if (seconds < 0 || seconds > 450 || (end && *end) || argv[2][0] != '/') return 2;
 	int output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (output < 0) { perror("output"); return 1; }
 	struct sigaction sa = {0}; sa.sa_handler = stop;
@@ -36,7 +37,9 @@ int main(int argc, char **argv)
 	uint64_t missing_pose = 0, invalid_clock = 0, stale = 0, gaps = 0;
 	uint64_t session = 0, sequence = 0, last_gyro = 0, first_gyro = 0;
 	int fd = -1, failed = 0;
-	while (!interrupted && now_ns() < deadline) {
+	uint64_t segment_bytes = 0, completed_segments = 0;
+	const uint64_t segment_limit = (UINT64_C(32) * 1024 * 1024 / sizeof(struct a081_tracking_packet)) * sizeof(struct a081_tracking_packet);
+	while (!interrupted && (!seconds || now_ns() < deadline)) {
 		if (fd < 0) {
 			fd = a081_tracking_connect(argv[1]);
 			if (fd < 0) { poll(NULL, 0, 20); continue; }
@@ -59,6 +62,15 @@ int main(int argc, char **argv)
 		if (session && packet.sequence != sequence + 1) gaps += packet.sequence - sequence - 1;
 		session = packet.session_id; sequence = packet.sequence; last_gyro = packet.gyro_boottime_ns;
 		if (!first_gyro) first_gyro = last_gyro;
+		if (!seconds && segment_bytes >= segment_limit) {
+			char retained[PATH_MAX];
+			int length = snprintf(retained, sizeof(retained), "%s.%s", argv[2], completed_segments ? "previous" : "first");
+			if (length < 0 || (size_t)length >= sizeof(retained) || close(output) != 0 || rename(argv[2], retained) != 0) { failed = 1; break; }
+			output = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+			if (output < 0) { failed = 1; break; }
+			++completed_segments; segment_bytes = 0;
+			fprintf(stderr, "raw_packet_rotation completed_segments=%" PRIu64 " retained=first+previous+current limit=%" PRIu64 " next_sequence=%" PRIu64 "\n", completed_segments, segment_limit, packet.sequence);
+		}
 		const unsigned char *bytes = (const unsigned char *)&packet;
 		size_t written = 0;
 		while (written < sizeof(packet)) {
@@ -68,7 +80,7 @@ int main(int argc, char **argv)
 			written += (size_t)n;
 		}
 		if (failed) break;
-		++packets;
+		++packets; segment_bytes += sizeof(packet);
 		uint64_t now = now_ns();
 		if (!(packet.flags & A081_TRACKING_CLOCK)) ++invalid_clock;
 		else if (packet.sample_monotonic_ns > now || now - packet.sample_monotonic_ns >= A081_TRACKING_MAX_AGE_NS) ++stale;
