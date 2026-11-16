@@ -1,3 +1,10 @@
+xr-head-tracking (0.1.11) unstable; urgency=medium
+
+  * Consume explicit QTimer-to-BOOTTIME offsets from XSL2 direct packets.
+  * Require stable session clock metadata and reject older packet layouts.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 03:24:35 +0800
+
 xr-head-tracking (0.1.10) unstable; urgency=medium
 
   * Consume the sole stock direct IMU stream with original timestamps and calibration semantics.
