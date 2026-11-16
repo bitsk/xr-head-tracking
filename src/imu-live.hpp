@@ -767,10 +767,17 @@ inline int run(int session, const std::string &uri)
         visual = std::make_unique<VisualInput>(exposure);
     }
     std::string model, config, calibration;
+    const char *device_option = std::getenv("XR_DEVICE");
+    const std::string device = device_option ? device_option : "a081";
+    if (device != "a081" && device != "vr700") {
+        report("imu_live_gate", failure(EINVAL), "XR_DEVICE must be a081 or vr700");
+        return 2;
+    }
+    const bool vr700 = device == "vr700";
     const char *cvp_option = std::getenv("A081_QVR_CVP_MODE");
     const std::string cvp_mode = cvp_option ? cvp_option : "stock";
-    if (cvp_mode != "stock" && cvp_mode != "disabled") {
-        report("imu_live_gate", failure(EINVAL), "A081_QVR_CVP_MODE must be stock or disabled");
+    if ((cvp_mode != "stock" && cvp_mode != "disabled") || (vr700 && cvp_mode != "stock")) {
+        report("imu_live_gate", failure(EINVAL), "A081_QVR_CVP_MODE must be stock or disabled; VR700 requires stock");
         return 2;
     }
     // The stock parser and Tracker3_5Core branches support this exact XML
@@ -779,13 +786,34 @@ inline int run(int session, const std::string &uri)
     const char *config_hash = cvp_mode == "disabled"
         ? "f67e7189447212a13b82bb18cc14161221e84d1f36eece205eed6a61ed9be276"
         : "aeef461d9ac5b191f0d2c3e83de3a5d45f305b0f7286c8fc4c5bcecb3b612db9";
-    if (!text_file("/proc/device-tree/model", model) || model.find("A081") == std::string::npos ||
+    const char *calibration_hash = "eeee483e5ac268a85cd2b6ba69241bb951612045fe05d61de2f35301d816ac00";
+    if (vr700) {
+        // The shipped VR700 trinity config is byte-identical to the pinned
+        // stock XML above. Keep that allowlist; the profile cannot replace it
+        // with an arbitrary modified config. Calibration is per device and
+        // its expected digest comes from the private imported session profile.
+        const char *profile_config_hash = std::getenv("XR_HEAD_CONFIG_SHA256");
+        calibration_hash = std::getenv("XR_HEAD_CALIBRATION_SHA256");
+        if (!profile_config_hash || std::strcmp(profile_config_hash, config_hash) ||
+            !calibration_hash || std::strlen(calibration_hash) != 64 ||
+            std::strspn(calibration_hash, "0123456789abcdef") != 64) {
+            report("imu_live_gate", failure(EINVAL), "VR700 requires the pinned stock config digest and a private calibration digest");
+            return 2;
+        }
+        std::string compatible;
+        if (!text_file("/proc/device-tree/compatible", compatible) ||
+            compatible.compare(0, sizeof("iqiyi,vr700"), "iqiyi,vr700", sizeof("iqiyi,vr700"))) {
+            report("imu_live_gate", failure(EINVAL), "VR700 requires matching device-tree compatible");
+            return 2;
+        }
+    }
+    if (!text_file("/proc/device-tree/model", model) || model.find(vr700 ? "VR700" : "A081") == std::string::npos ||
         !verified_xml("A081_QVR_CONFIG6", config_hash, config) ||
-        !verified_xml("A081_QVR_CALIBRATION", "eeee483e5ac268a85cd2b6ba69241bb951612045fe05d61de2f35301d816ac00", calibration)) {
-        report("imu_live_gate", failure(EINVAL), "A081 identity, pinned config variant and original calibration are required before mutation");
+        !verified_xml("A081_QVR_CALIBRATION", calibration_hash, calibration)) {
+        report("imu_live_gate", failure(EINVAL), "Matching device identity, pinned config variant and original calibration are required before mutation");
         return 2;
     }
-    report("config_variant", {}, "cvp_mode=" + cvp_mode +
+    report("config_variant", {}, "device=" + device + " cvp_mode=" + cvp_mode +
            " config_sha256=" + config_hash + " signed_algorithm=unchanged calibration=original");
     config.erase(std::remove(config.begin(), config.end(), '\n'), config.end());
     std::cout << "stage=imu_live_scope max_input_seconds=" << (visual ? 370 : 5) << " max_notifications=" << (visual ? 200000 : 5000) <<

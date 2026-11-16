@@ -98,10 +98,12 @@ void usage()
                  "A081_QVR_STAGE=version|init|health|imu-live and A081_QVR_URI are environment options.\n"
                  "imu-live requires the private plugin, exact stock XML paths in A081_QVR_CONFIG6\n"
                  "and A081_QVR_CALIBRATION, XR_SEE_IMU_SOCKET and A081_QVR_IMU_HISTORY.\n"
+                 "XR_DEVICE defaults to a081; vr700 also requires matching device-tree identity\n"
+                 "and XR_HEAD_CONFIG_SHA256 / XR_HEAD_CALIBRATION_SHA256 from its private profile.\n"
                  "It consumes the sole stock 800Hz direct IMU producer with original\n"
                  "BOOTTIME timestamps; camera/visual 6DoF require the visual session.\n"
                  "A081_QVR_CVP_MODE=disabled requires the pinned config variant with the\n"
-                 "original algorithm's CvpConfig enable=false option; default is stock.\n"
+                 "original algorithm's CvpConfig enable=false option on A081; VR700 requires stock.\n"
 
                  "--camera-capture needs no DSP session: capture configured real V4L2 nodes\n"
                  "in A081_QVR_CAMERA_NODES=/dev/videoN,... for 5 seconds. Save first raw/Y8\n"

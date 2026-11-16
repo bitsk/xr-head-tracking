@@ -31,6 +31,21 @@ cmake --build build -j4
 
 DSP runtime 和型号默认 config6 已归档到独立公开 [xr-vendor-assets](https://github.com/bitsk/xr-vendor-assets) Release。通过 xr-image-tools 的 `tools/vendor.py fetch` 下载并校验后，缓存里的 `qvr/runtime/qcom/` 提供 DSP 文件，`qvr/config/config6.xml` 提供型号默认配置；rootfs 安装目标记录在 vendor.lock.json 中。每台设备的相机校准独立提供，不从其他设备的 persist 复制。正常使用不依赖整份原厂镜像。
 
+`XR_DEVICE` 默认为 `a081`，保留原有型号与 XML 摘要校验。VR700 会话显式设置
+`XR_DEVICE=vr700`；生产者要求本机设备树同时具有 `VR700` 型号和
+`iqiyi,vr700` 首项 compatible。`A081_QVR_CONFIG6` 与
+`A081_QVR_CALIBRATION` 继续作为共享接口字段，分别指向原厂 trinity 配置和
+本机私有标定。会话从已导入的私有 profile 传入
+`XR_HEAD_CONFIG_SHA256`、`XR_HEAD_CALIBRATION_SHA256`，后者必须是完整的小写
+SHA-256；生产者在任何 DSP/采集操作前验证文件摘要。VR700 的 config 摘要还必须
+匹配内置的原厂白名单，不接受 profile 指定的任意修改配置。原厂 trinity 配置与
+现有 stock 配置字节相同，因此共享同一白名单值。
+
+VR700 仅允许 `A081_QVR_CVP_MODE=stock`，未设置时也采用 stock；不沿用 MIX 的
+disabled 变体。私有标定摘要不会编入公共源码，也不会回退到 MIX 标定。型号接入
+保留原有 direct IMU、QCFT 相机、时钟与失效条件；通过文件校验不代表已经完成
+VR700 DSP、四路采集、坐标或真实跟踪验收。
+
 ## openKylin 打包
 
 本仓库包含独立的 `debian/` 配方。使用目标发行线的干净构建环境运行 `dpkg-buildpackage -us -uc -b`，预先准备 Build-Depends 和离线构建输入。包构建、目标系统安装和设备验收分别记录。
