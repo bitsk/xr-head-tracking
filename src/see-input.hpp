@@ -19,7 +19,7 @@ public:
         ucred peer{};socklen_t length=sizeof(peer);
         if(getsockopt(fd_,SOL_SOCKET,SO_PEERCRED,&peer,&length) || peer.uid!=geteuid()) return false;
         report("see_input",{},"source=direct period_us="+std::to_string(period_)+
-            " notification=sns_llcm_poll wire=XSL2 raw_clock=qtimer_ns sample_clock=boottime_ns");
+            " notification=sns_llcm_poll wire=XSL3 raw_clock=qtimer_ns sample_clock=boottime_ns");
         return true;
     }
     int fd() const { return fd_; }
@@ -36,17 +36,16 @@ public:
             std::uint64_t time{};float xyz[3]{};
             const auto arrival=boottime_ns();
             if(!xr::see::decode(packet,kind==1,time,xyz) || time<=last_[kind] ||
-                time>arrival+1000000 || arrival>time+1000000000 ||
-                packet.arrival_boottime_ns>arrival ||
-                (clock_set_ && (packet.qtimer_to_boottime_ns!=clock_offset_ ||
-                                packet.clock_uncertainty_ns!=clock_uncertainty_))) {
+                xr::see::get64(packet.event,16)<=last_raw_[kind] ||
+                packet.clock_anchor_qtimer_ns<last_anchor_[kind] ||
+                (time>arrival && time-arrival>xr::see::qtimer_tick_ns) || arrival>time+1000000000 ||
+                packet.arrival_boottime_ns>arrival) {
                 report("see_input",failure(EPROTO),"invalid sample clock/order/value");return false;
             }
             if(!clock_set_) {
-                clock_set_=true;clock_offset_=packet.qtimer_to_boottime_ns;
-                clock_uncertainty_=packet.clock_uncertainty_ns;
-                report("see_clock",{},"qtimer_to_boottime_ns="+std::to_string(clock_offset_)+
-                    " uncertainty_ns="+std::to_string(clock_uncertainty_)+
+                clock_set_=true;
+                report("see_clock",{},"qtimer_to_boottime_ns="+std::to_string(packet.qtimer_to_boottime_ns)+
+                    " uncertainty_ns="+std::to_string(packet.clock_uncertainty_ns)+
                     " raw_qtimer_ns="+std::to_string(xr::see::get64(packet.event,16))+
                     " sample_boottime_ns="+std::to_string(time));
             }
@@ -59,6 +58,8 @@ public:
             max_delivery_[kind]=std::max(max_delivery_[kind],arrival-packet.arrival_boottime_ns);
             if(arrival>=time) max_age_[kind]=std::max(max_age_[kind],arrival-time);
             counter_[kind]=counter;last_[kind]=time;++samples_[kind];
+            last_raw_[kind]=xr::see::get64(packet.event,16);
+            last_anchor_[kind]=packet.clock_anchor_qtimer_ns;
             Sample sample{time,{},kind==1};
             for(unsigned axis=0;axis<3;++axis)
                 sample.value[axis]=xyz[std::abs(axes[axis])-1]*(axes[axis]<0 ? -1.0f : 1.0f);
@@ -85,6 +86,5 @@ private:
     std::uint64_t max_interval_[2]{},max_age_[2]{},max_delivery_[2]{};
     std::uint32_t counter_[2]{};
     bool clock_set_{};
-    std::int64_t clock_offset_{};
-    std::uint64_t clock_uncertainty_{};
+    std::uint64_t last_raw_[2]{},last_anchor_[2]{};
 };
