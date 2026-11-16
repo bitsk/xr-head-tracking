@@ -1,3 +1,9 @@
+xr-head-tracking (0.1.10) unstable; urgency=medium
+
+  * Consume the sole stock direct IMU stream with original timestamps and calibration semantics.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 02:45:28 +0800
+
 xr-head-tracking (0.1.9) unstable; urgency=medium
 
   * Resume observed IMU advancement after a fresh anchor supersedes an older gap.

@@ -9,6 +9,9 @@
 #include <xr/device/a081_camera_groups.hpp>
 #include "a081_tracking_server.hpp"
 #include <xr/head/production-v2/a081_imu_history.h>
+#include <xr/device/see_low_latency.hpp>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <condition_variable>
 #include <memory>
 #include <sys/vfs.h>
@@ -140,27 +143,6 @@ inline bool verified_xml(const char *variable, const char *expected, std::string
     return true;
 }
 
-inline bool axis_mapping(std::array<int, 3> &axes)
-{
-    const char *value = std::getenv("A081_QVR_IIO_TO_ANDROID");
-    if (!value) {
-        report("iio_axis_gate", failure(EINVAL),
-               "A081_QVR_IIO_TO_ANDROID is required: verified signed source-axis permutation, e.g. 1,2,3 only after confirming Android-portrait equivalence");
-        return false;
-    }
-    std::istringstream input(value);
-    char comma1 = 0, comma2 = 0, trailing = 0;
-    if (!(input >> axes[0] >> comma1 >> axes[1] >> comma2 >> axes[2]) ||
-        comma1 != ',' || comma2 != ',' || (input >> trailing)) return false;
-    for (unsigned i = 0; i < 3; ++i) {
-        if (axes[i] < -3 || axes[i] > 3 || axes[i] == 0) return false;
-        for (unsigned j = 0; j < i; ++j)
-            if (std::abs(axes[i]) == std::abs(axes[j])) return false;
-    }
-    report("iio_axis_gate", {}, std::string("explicit IIO-to-Android-portrait permutation=") + value);
-    return true;
-}
-
 inline volatile std::sig_atomic_t interrupted = 0;
 inline void request_stop(int) { interrupted = 1; }
 class Signals {
@@ -190,225 +172,12 @@ private:
     bool int_set_{}, term_set_{};
 };
 
-class IioLocks {
-public:
-    bool acquire()
-    {
-        std::vector<std::string> paths{"/run/a081-iio.lock"};
-        if (const char *runtime = std::getenv("XDG_RUNTIME_DIR")) {
-            const std::string path = std::string(runtime) + "/a081-iio.lock";
-            if (path != paths.front()) paths.push_back(path);
-        }
-        for (const auto &path : paths) {
-            const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-            if (fd < 0) { report("iio_lock", failure(errno), path); return false; }
-            fds_.push_back(fd);
-            if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-                report("iio_lock", failure(errno), path);
-                return false;
-            }
-        }
-        return true;
-    }
-    ~IioLocks() { for (int fd : fds_) ::close(fd); }
-private:
-    std::vector<int> fds_;
-};
-
 struct Sample {
     std::uint64_t time{};
     std::array<float, 3> value{};
     bool gyro{};
 };
-struct Scan {
-    std::int32_t xyz[3];
-    std::int32_t padding;
-    std::int64_t time;
-};
-static_assert(sizeof(Scan) == 24 && offsetof(Scan, time) == 16);
-
-class IioStream {
-public:
-    IioStream(const char *name, const char *channel, bool gyro)
-        : name_(name), channel_(channel), gyro_(gyro) {}
-    ~IioStream() { restore(); }
-    bool discover()
-    {
-        DIR *dir = opendir("/sys/bus/iio/devices");
-        if (!dir) { report("iio_discover", failure(errno), name_); return false; }
-        std::string node;
-        unsigned matches = 0;
-        while (auto *entry = readdir(dir)) {
-            if (std::strncmp(entry->d_name, "iio:device", 10)) continue;
-            std::string actual;
-            const std::string candidate = std::string("/sys/bus/iio/devices/") + entry->d_name;
-            if (attribute(candidate + "/name", actual) && actual == name_) {
-                node = entry->d_name;
-                ++matches;
-            }
-        }
-        closedir(dir);
-        if (matches != 1) { report("iio_discover", failure(ENODEV), name_); return false; }
-        path_ = "/sys/bus/iio/devices/" + node;
-        node_ = "/dev/" + node;
-        std::string value;
-        if (!expect("buffer/enable", "0")) return false;
-        for (unsigned i = 0; i < 4; ++i) {
-            stems_[i] = i == 3 ? "in_timestamp" : "in_" + channel_ + "_" + "xyz"[i];
-            if (!expect("scan_elements/" + stems_[i] + "_index", std::to_string(i)) ||
-                !expect("scan_elements/" + stems_[i] + "_type", i == 3 ? "le:s64/64>>0" : "le:s32/32>>0"))
-                return false;
-        }
-        // Extra enabled channels would invalidate the confirmed 24-byte scan.
-        dir = opendir((path_ + "/scan_elements").c_str());
-        if (!dir) return false;
-        bool shape = true;
-        while (auto *entry = readdir(dir)) {
-            const std::string attr = entry->d_name;
-            if (attr.size() < 3 || attr.substr(attr.size() - 3) != "_en") continue;
-            bool known = false;
-            for (const auto &stem : stems_) known = known || attr == stem + "_en";
-            if (!known && (!attribute(path_ + "/scan_elements/" + attr, value) || value != "0")) shape = false;
-        }
-        closedir(dir);
-        if (!shape || !attribute(path_ + "/in_" + channel_ + "_scale", value)) return false;
-        char *end = nullptr;
-        errno = 0;
-        scale_ = std::strtod(value.c_str(), &end);
-        if (errno || end != value.c_str() + value.size() || !std::isfinite(scale_) ||
-            std::abs(scale_ - 0.000001) > 1e-15) {
-            report("iio_scale", failure(EINVAL), path_ + " scale=" + value);
-            return false;
-        }
-        if (!attribute(path_ + "/in_" + channel_ + "_sampling_frequency", rate_)) return false;
-        report("iio_discover", {}, name_ + " node=" + node_ + " scale=" + value +
-               " previous_sampling_frequency=" + rate_);
-        return true;
-    }
-    bool configure(unsigned requested_rate)
-    {
-        if (!expect("buffer/enable", "0")) return false;
-        std::string available;
-        if (!attribute(path_ + "/in_" + channel_ + "_sampling_frequency_available", available)) return false;
-        std::istringstream values(available);
-        double value = 0;
-        bool supported = false;
-        while (values >> value) supported = supported || value == requested_rate;
-        if (!supported) {
-            report("iio_rate", failure(ENOTSUP), name_ + " requested=" + std::to_string(requested_rate));
-            return false;
-        }
-        owned_ = true;
-        if (!change("in_" + channel_ + "_sampling_frequency", std::to_string(requested_rate) + ".000000")) return false;
-        for (const auto &stem : stems_)
-            if (!change("scan_elements/" + stem + "_en", "1")) return false;
-        if (!change("current_timestamp_clock", "boottime") ||
-            !change("buffer/length", "256") || !change("buffer/watermark", "1")) return false;
-        if (access((path_ + "/buffer/hwfifo_timeout").c_str(), F_OK) == 0 &&
-            !change("buffer/hwfifo_timeout", "0.000000")) return false;
-        fd_ = ::open(node_.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd_ < 0) { report("iio_open", failure(errno), node_); return false; }
-        return true;
-    }
-    bool enable() { return change("buffer/enable", "1"); }
-    bool disable()
-    {
-        if (!owned_) return true;
-        const auto result = write_attribute(path_ + "/buffer/enable", "0");
-        report("iio_disable", result, name_);
-        return static_cast<bool>(result);
-    }
-    bool restore()
-    {
-        if (!owned_) return true;
-        bool ok = disable();
-        if (fd_ >= 0) { ok = (::close(fd_) == 0) && ok; fd_ = -1; }
-        for (auto item = saved_.rbegin(); item != saved_.rend(); ++item) {
-            const auto result = write_attribute(item->first, item->second);
-            std::string actual;
-            const bool restored = result && attribute(item->first, actual) && actual == item->second;
-            report("iio_restore", restored ? Result{} : (result ? failure(EIO) : result),
-                   "path=" + item->first + " value=" + item->second);
-            ok = restored && ok;
-        }
-        saved_.clear();
-        owned_ = false;
-        return ok;
-    }
-    bool read_batch(std::vector<Sample> &batch, const std::array<int, 3> &axes)
-    {
-        for (unsigned i = 0; i < 64; ++i) {
-            Scan raw{};
-            const auto n = ::read(fd_, &raw, sizeof(raw));
-            if (n < 0 && (errno == EAGAIN || errno == EINTR)) return true;
-            if (n != sizeof(raw)) {
-                report("iio_read", failure(n < 0 ? errno : EIO), name_);
-                return false;
-            }
-            ++samples;
-            if (raw.time <= 0 || static_cast<std::uint64_t>(raw.time) <= last_time_) {
-                ++discarded;
-                continue;
-            }
-            const auto now = boottime_ns();
-            const auto time = static_cast<std::uint64_t>(raw.time);
-            // Preserve the actual scan timestamp. Reject a clock mismatch;
-            // old queued samples are discarded, never retimestamped.
-            if (!now || time > now + 1000000ULL) {
-                report("iio_timestamp", failure(EPROTO), name_ + " sample=" + std::to_string(time) + " boottime=" + std::to_string(now));
-                return false;
-            }
-            last_time_ = time;
-            if (now > time && now - time > 1000000000ULL) { ++discarded; continue; }
-            Sample sample{time, {}, gyro_};
-            for (unsigned axis = 0; axis < 3; ++axis) {
-                const int source = axes[axis];
-                const double sign = source < 0 ? -1.0 : 1.0;
-                sample.value[axis] = static_cast<float>(raw.xyz[std::abs(source) - 1] * scale_ * sign);
-            }
-            batch.push_back(sample);
-        }
-        return true;
-    }
-    int fd() const { return fd_; }
-    void report_rate() const
-    {
-        std::string requested, reported;
-        const std::string stem = path_ + "/in_" + channel_ + "_sampling_frequency";
-        if (attribute(stem, requested) && attribute(stem + "_reported", reported))
-            report("iio_rate", {}, name_ + " requested=" + requested + " firmware_reported=" + reported);
-        else report("iio_rate", failure(EIO), name_);
-    }
-    std::uint64_t samples{}, discarded{};
-private:
-    bool expect(const std::string &attr, const std::string &expected)
-    {
-        std::string value;
-        if (attribute(path_ + "/" + attr, value) && value == expected) return true;
-        report("iio_attribute_gate", failure(EINVAL), path_ + "/" + attr + " expected=" + expected + " actual=" + value);
-        return false;
-    }
-    bool change(const std::string &attr, const std::string &value)
-    {
-        const std::string path = path_ + "/" + attr;
-        std::string old;
-        if (!attribute(path, old)) { report("iio_save", failure(EIO), path); return false; }
-        // Log the journal before mutation, including unchanged values. This
-        // also provides recovery values if an external SIGKILL prevents RAII.
-        report("iio_save", {}, "path=" + path + " value=" + old);
-        saved_.emplace_back(path, old);
-        const auto result = write_attribute(path, value);
-        report("iio_configure", result, "path=" + path + " value=" + value);
-        return result && expect(attr, value);
-    }
-    std::string name_, channel_, path_, node_, rate_;
-    std::array<std::string, 4> stems_;
-    bool gyro_, owned_{};
-    int fd_ = -1;
-    double scale_{};
-    std::uint64_t last_time_{};
-    std::vector<std::pair<std::string, std::string>> saved_;
-};
+#include "see-input.hpp"
 
 struct RingSpec {
     head::RingId id;
@@ -662,13 +431,13 @@ private:
     bool have_baseline_{}, retained_{};
 };
 
-// One IIO owner drains sensors independently of the serialized OEM RPC loop.
+// Drain the sole device-io direct stream independently of the serialized OEM RPC loop.
 // The OEM still receives every ordered sample; the presentation path can read
 // the real gyro history while camera_frame_from_sof is blocked in FastRPC.
 class LiveImuReader {
 public:
     ~LiveImuReader() { stop(); }
-    bool start(IioStream &accel, IioStream &gyro, const std::array<int, 3> &axes, const char *path)
+    bool start(DirectImuInput &input, const std::array<int, 3> &axes, const char *path)
     {
         if (std::strncmp(path, "/run/", 5)) return false;
         const char *group = std::getenv("A081_QVR_IMU_READER_GID");
@@ -685,19 +454,18 @@ public:
         if (mapping == MAP_FAILED) return false;
         history_ = static_cast<a081_imu_history *>(mapping);
         a081_imu_store(&history_->magic, A081_IMU_HISTORY_MAGIC);
-        worker_ = std::thread([this, &accel, &gyro, axes] {
+        if (!input.connect()) return false;
+        worker_ = std::thread([this, &input, axes] {
             while (!stop_.load()) {
-                pollfd descriptors[2]{{accel.fd(), POLLIN, 0}, {gyro.fd(), POLLIN, 0}};
-                const int ready = poll(descriptors, 2, 10);
+                pollfd descriptor{input.fd(), POLLIN, 0};
+                const int ready = poll(&descriptor, 1, 10);
                 if (ready < 0 && errno == EINTR) continue;
                 if (ready < 0) { fail(); break; }
                 if (!ready) continue;
                 std::vector<Sample> batch;
                 bool ok = true;
-                for (unsigned i=0;i<2;++i) {
-                    if (descriptors[i].revents & (POLLERR|POLLHUP|POLLNVAL)) { ok=false; break; }
-                    if ((descriptors[i].revents & POLLIN) && !(i ? gyro : accel).read_batch(batch, axes)) { ok=false; break; }
-                }
+                if (descriptor.revents & (POLLERR|POLLHUP|POLLNVAL)) ok=false;
+                if (ok && (descriptor.revents & POLLIN)) ok=input.read_batch(batch,axes);
                 if (!ok) { fail(); break; }
                 for (const auto &sample : batch) if (sample.gyro) {
                     const auto before=TrackingServer::now(CLOCK_MONOTONIC);
@@ -784,7 +552,7 @@ private:
     std::thread worker;
 };
 
-inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &ring, Ring &pose_ring,
+inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pose_ring,
                  TrackingServer &stream, const std::array<int, 3> &axes, std::uint64_t start,
                  VisualInput *visual = nullptr)
 {
@@ -803,12 +571,13 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
     std::uint64_t catchup_started_ns = 0, imu_deferrals = 0, last_camera_rpc_ns = 0;
     std::unique_ptr<LiveImuReader> reader;
     const char *history_path = std::getenv("A081_QVR_IMU_HISTORY");
-    if (visual && history_path && *history_path) {
+    if (history_path && *history_path) {
         reader = std::make_unique<LiveImuReader>();
-        if (!reader->start(accel, gyro, axes, history_path)) {
+        if (!reader->start(input, axes, history_path)) {
             report("imu_reader_start", failure(errno ? errno : EINVAL)); return false;
         }
     }
+    if (!reader) { report("see_input", failure(EINVAL), "direct source requires IMU history reader"); return false; }
     std::array<std::uint64_t, 5> pose_reads{};
     bool ok = true;
     while (!interrupted && boottime_ns() < deadline && notified < max_notifications) {
@@ -821,23 +590,8 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
         }
         std::vector<Sample> batch;
         batch.reserve(128);
-        if (reader) {
-            if (!reader->take(batch)) { ok=false; break; }
-            if (batch.empty()) continue;
-        } else {
-            pollfd descriptors[2]{{accel.fd(), POLLIN, 0}, {gyro.fd(), POLLIN, 0}};
-            const int ready = poll(descriptors, 2, 20);
-            if (ready < 0) {
-                if (errno == EINTR) continue;
-                report("iio_poll", failure(errno)); ok=false; break;
-            }
-            if (!ready) continue;
-            for (unsigned i=0;i<2;++i) {
-                if (descriptors[i].revents & (POLLERR|POLLHUP|POLLNVAL)) { ok=false; break; }
-                if ((descriptors[i].revents & POLLIN) && !(i ? gyro : accel).read_batch(batch, axes)) { ok=false; break; }
-            }
-            if (!ok) break;
-        }
+        if (!reader->take(batch)) { ok=false; break; }
+        if (batch.empty()) continue;
         std::stable_sort(batch.begin(), batch.end(), [](const Sample &a, const Sample &b) {
             return a.time == b.time ? a.gyro < b.gyro : a.time < b.time;
         });
@@ -848,7 +602,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
                 if (accel_history.size() > 128) accel_history.pop_front();
                 continue;
             }
-            // Independent IIO delivery may expose a newer accel before an
+            // Independent direct delivery may expose a newer accel before an
             // older gyro is read. Retain real history instead of losing the
             // previous suitable sample, or relabelling the newer timestamp.
             const auto accel_at = std::find_if(accel_history.rbegin(), accel_history.rend(),
@@ -893,9 +647,8 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
             // those before starting another camera RPC, with a bounded budget
             // so a saturated IMU caller cannot starve visual localization.
             const auto now = boottime_ns();
-            pollfd pending{gyro.fd(), POLLIN, 0};
             if (imu_catchup && last && now > last + 3000000ULL &&
-                (reader ? reader->pending() : poll(&pending, 1, 0) > 0 && (pending.revents & POLLIN))) {
+                reader->pending()) {
                 if (!catchup_started_ns) catchup_started_ns = now;
                 if (now - catchup_started_ns < 8000000ULL) { ++imu_deferrals; continue; }
             }
@@ -971,8 +724,6 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
     {
     std::lock_guard<std::mutex> log(camera::output_mutex);
     std::cout << "stage=imu_input_summary elapsed_ns=" << boottime_ns() - start
-              << " accel_samples=" << accel.samples << " gyro_samples=" << gyro.samples
-              << " discarded_accel=" << accel.discarded << " discarded_gyro=" << gyro.discarded
               << " skipped_no_recent_accel=" << skipped << " notifications=" << notified
               << " first_gyro_ns=" << first << " last_gyro_ns=" << last
               << " interrupted=" << interrupted << " camera_rpc_success=" << camera_calls
@@ -980,8 +731,7 @@ inline bool feed(QvrModule &module, IioStream &accel, IioStream &gyro, Ring &rin
               << " imu_catchup=" << imu_catchup << " imu_deferrals=" << imu_deferrals
               << " last_camera_submit_ns=" << last_camera_time << " visual_6dof=not_validated" << std::endl;
     }
-    accel.report_rate();
-    gyro.report_rate();
+    input.summary();
     if (stream.enabled()) {
         std::cout << "stage=pose_stream_reads copied=" << pose_reads[A081_POSE_COPIED]
                   << " bad_index=" << pose_reads[A081_POSE_BAD_INDEX]
@@ -998,8 +748,12 @@ inline int run(int session, const std::string &uri)
         report("imu_live_gate", failure(ENOTSUP), "requires private in-process -P plugin");
         return 2;
     }
-    std::array<int, 3> axes{};
-    unsigned requested_rate = 100;
+    const std::array<int, 3> axes{1,2,3};
+    constexpr unsigned requested_rate = 800;
+    DirectImuInput input;
+    if (std::getenv("XR_HEAD_IMU_SOURCE") || std::getenv("A081_QVR_IMU_HZ")) {
+        report("imu_live_gate", failure(EINVAL), "obsolete source/rate override: this build uses stock direct 800 Hz"); return 2;
+    }
     std::unique_ptr<VisualInput> visual;
     if (const char *option = std::getenv("A081_QVR_VISUAL")) {
         const char *value = std::getenv("A081_QVR_CAMERA_EXPOSURE_NS");
@@ -1011,14 +765,6 @@ inline int run(int session, const std::string &uri)
             report("visual_gate", failure(EINVAL), "Requires QCFT and a real gate owner with fixed pre-STREAMON exposure"); return 2;
         }
         visual = std::make_unique<VisualInput>(exposure);
-    }
-    if (const char *rate = std::getenv("A081_QVR_IMU_HZ")) {
-        const std::string selected(rate);
-        if (selected != "25" && selected != "50" && selected != "100" && selected != "200" && selected != "500") {
-            report("imu_live_gate", failure(EINVAL), "A081_QVR_IMU_HZ must be 25,50,100,200 or 500");
-            return 2;
-        }
-        requested_rate = static_cast<unsigned>(std::stoul(selected));
     }
     std::string model, config, calibration;
     const char *cvp_option = std::getenv("A081_QVR_CVP_MODE");
@@ -1034,23 +780,20 @@ inline int run(int session, const std::string &uri)
         ? "f67e7189447212a13b82bb18cc14161221e84d1f36eece205eed6a61ed9be276"
         : "aeef461d9ac5b191f0d2c3e83de3a5d45f305b0f7286c8fc4c5bcecb3b612db9";
     if (!text_file("/proc/device-tree/model", model) || model.find("A081") == std::string::npos ||
-        !axis_mapping(axes) ||
         !verified_xml("A081_QVR_CONFIG6", config_hash, config) ||
         !verified_xml("A081_QVR_CALIBRATION", "eeee483e5ac268a85cd2b6ba69241bb951612045fe05d61de2f35301d816ac00", calibration)) {
-        report("imu_live_gate", failure(EINVAL), "A081 identity, explicit axes, pinned config variant and original calibration are required before mutation");
+        report("imu_live_gate", failure(EINVAL), "A081 identity, pinned config variant and original calibration are required before mutation");
         return 2;
     }
     report("config_variant", {}, "cvp_mode=" + cvp_mode +
            " config_sha256=" + config_hash + " signed_algorithm=unchanged calibration=original");
     config.erase(std::remove(config.begin(), config.end(), '\n'), config.end());
     std::cout << "stage=imu_live_scope max_input_seconds=" << (visual ? 370 : 5) << " max_notifications=" << (visual ? 200000 : 5000) <<
-                 " source=real_qcom_see_iio camera_input=" << (visual ? "real_qcft_four_camera" : "none")
+                 " source=real_see_low_latency camera_input=" << (visual ? "real_qcft_four_camera" : "none")
               << " visual_6dof=not_validated DSP_start_sensor_frequency=" << requested_rate
               << " continuous_requested=" << (std::getenv("A081_QVR_CONTINUOUS") ? std::getenv("A081_QVR_CONTINUOUS") : "0")
               << " actual_frequency=reported_per_stream RPC_calls=synchronous_external_process_timeout_still_required" << std::endl;
     Signals signals;
-    IioLocks locks;
-    IioStream accel("qcom-see-accel", "accel", false), gyro("qcom-see-gyro", "anglvel", true);
     std::array<Ring, 7> rings;
     TrackingServer stream;
     QvrModule module(session);
@@ -1063,8 +806,7 @@ inline int run(int session, const std::string &uri)
     try {
         ok = stream.open_from_environment();
         if (!ok) report("tracking_stream_open", failure(errno));
-        ok = ok && signals.install() && locks.acquire() && accel.discover() && gyro.discover() &&
-             accel.configure(requested_rate) && gyro.configure(requested_rate);
+        ok = ok && signals.install();
         if (ok) { const auto r = module.open(uri, message); report("open", r, message); opened = ok = static_cast<bool>(r); }
         if (ok) { const auto r = module.driver_version(message); report("driver_version", r, message); ok = static_cast<bool>(r); }
         for (std::size_t i = 0; ok && i < rings.size(); ++i) ok = rings[i].allocate(session, ring_specs[i]);
@@ -1094,9 +836,9 @@ inline int run(int session, const std::string &uri)
         }
         if (ok && !interrupted) {
             const auto start_time = boottime_ns();
-            ok = start_time != 0 && accel.enable() && gyro.enable();
+            ok = start_time != 0;
             if (ok && visual) visual->start();
-            if (ok) ok = feed(module, accel, gyro, rings[1], rings[2], stream, axes, start_time, visual.get());
+            if (ok) ok = feed(module, input, rings[1], rings[2], stream, axes, start_time, visual.get());
         } else if (interrupted) {
             ok = false;
         }
@@ -1106,16 +848,15 @@ inline int run(int session, const std::string &uri)
         report("imu_live_exception", failure(EIO), e.what());
         ok = false;
     }
-    // EOF invalidates consumers before DSP stop/deinit and IIO restoration.
+    // EOF invalidates consumers before DSP stop/deinit and direct-stream closure.
     { std::lock_guard<std::mutex> log(camera::output_mutex); stream.close(); }
+    input.close(); // stop SDSP acquisition before the longer CDSP teardown
     if (visual) {
         visual->finish();
         ok = visual->result.load() == 0 && ok;
         visual->groups.summary();
     }
     // All cleanup is explicit so the log includes the real return values.
-    ok = gyro.disable() && ok;
-    ok = accel.disable() && ok;
     if (module.stop_required()) {
         report("stop_begin", {}, "boottime_ns=" + std::to_string(boottime_ns()));
         const auto r = module.stop(); report("stop", r);
@@ -1169,8 +910,6 @@ inline int run(int session, const std::string &uri)
     }
     if (!safe_to_release)
         report("ring_release_deferred", failure(EBUSY), "retain DMA mappings/fds until private plugin process exits and closes its FastRPC session");
-    ok = gyro.restore() && ok;
-    ok = accel.restore() && ok;
     if (ok && pd_release_pending) {
         std::cout << "stage=imu_pd_release_required rc=3 owned_live=" << owned[2]
                   << " owned_bytes=" << owned[3]

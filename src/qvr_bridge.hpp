@@ -51,7 +51,7 @@ public:
     // Neither string includes its terminating NUL. Caller must configure the
     // rings, mode and orientation before start, and retain all mapped rings
     // until stop and deinit succeed. No camera/sensor input is synthesized.
-    Result start(std::string_view config6, std::string_view calibration, float sensor_frequency_hz = 1000.0f);
+    Result start(std::string_view config6, std::string_view calibration, float sensor_frequency_hz = 800.0f);
     Result stop();
     // Publish the complete combined 64-byte ring0 record and its index before
     // this synchronous call. It consumes the current slot, not a queue. RPC

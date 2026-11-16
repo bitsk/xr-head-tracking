@@ -2,6 +2,14 @@
 
 QVR/CDSP 头部跟踪与姿态接口。
 
+正常输入仅消费 xr-device-io 的原厂 800 Hz direct 流。
+`XR_SEE_IMU_SOCKET` 指向会话管理器启动的唯一 SDSP 生产者；
+`A081_QVR_IMU_HISTORY` 提供独立于相机 RPC 的实时陀螺共享历史。
+不再打开 IIO 或选择另一采样档位。回撤实现通过 Git 提交重建。
+原厂 Android 未校准事件的三轴值和采样时刻显式转换成现有 external64
+输入；保留每台设备原有相机/IMU 标定和 DSP 算法，不重复扣除 bias。
+生产者消失、格式/时钟不符或顺序错误会终止输入，不静默切换数据源。
+
 
 构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://github.com/bitsk/openkylin-xr-docs)。
 
