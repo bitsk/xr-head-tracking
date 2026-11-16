@@ -1,3 +1,9 @@
+xr-head-tracking (0.1.9) unstable; urgency=medium
+
+  * Resume observed IMU advancement after a fresh anchor supersedes an older gap.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 02:15:33 +0800
+
 xr-head-tracking (0.1.8) unstable; urgency=medium
 
   * Read IMU independently of serialized camera RPC and publish bounded RAM history.

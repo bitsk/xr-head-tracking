@@ -66,16 +66,24 @@ static inline bool a081_imu_advance(const struct a081_imu_history *h, uint64_t a
     if (!a081_imu_read(h,end,&tail) || tail.mono_ns<=anchor || tail.mono_ns>now ||
         now-tail.mono_ns>UINT64_C(10000000)) return false;
     uint64_t begin=end>A081_IMU_HISTORY_COUNT-1 ? end-(A081_IMU_HISTORY_COUNT-1) : 1;
+    // Find the sample bracketing this anchor first. A gap before a new OEM
+    // anchor is already covered by that anchor and must not disable live IMU
+    // advancement until the entire ring turns over. Still reject every gap
+    // within the interval that we actually integrate.
     struct a081_imu_sample previous={0};
+    uint64_t first=end;
+    for (;;) {
+        if (!a081_imu_read(h,first,&previous)) return false;
+        if (previous.mono_ns<=anchor) break;
+        if (first==begin) return false;
+        --first;
+    }
     double result[4]; memcpy(result,q,sizeof(result));
     uint64_t cursor=anchor;
-    bool bracket=false;
-    for (uint64_t i=begin;i<=end;++i) {
+    for (uint64_t i=first+1;i<=end;++i) {
         struct a081_imu_sample sample;
         if (!a081_imu_read(h,i,&sample)) return false;
-        if (previous.mono_ns && (sample.mono_ns<=previous.mono_ns || sample.mono_ns-previous.mono_ns>UINT64_C(5000000))) return false;
-        if (sample.mono_ns<=anchor) { previous=sample; bracket=true; continue; }
-        if (!bracket || !previous.mono_ns || cursor<previous.mono_ns) return false;
+        if (sample.mono_ns<=previous.mono_ns || sample.mono_ns-previous.mono_ns>UINT64_C(5000000)) return false;
         double fraction=(double)(cursor-previous.mono_ns)/(double)(sample.mono_ns-previous.mono_ns);
         double avg[3];
         for (unsigned j=0;j<3;++j) avg[j]=.5*(previous.gyro[j]+fraction*(sample.gyro[j]-previous.gyro[j])+sample.gyro[j]);
