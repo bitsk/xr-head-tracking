@@ -1,3 +1,11 @@
+xr-head-tracking (0.1.15) unstable; urgency=medium
+
+  * Query complete original80-slot pose history by nearest nonzero camera epoch.
+  * Serialize DMA read intervals and bind history callbacks for the capture lifetime.
+  * Remove exporter pose-cache feeds while preserving independently matched native stream publication.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 01:01:28 +0800
+
 xr-head-tracking (0.1.14) unstable; urgency=medium
 
   * Consume original native shared gyro/accel rings and asynchronous QDI/HRP output.

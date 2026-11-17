@@ -244,6 +244,7 @@ public:
     }
     bool summary(const char *when)
     {
+        std::lock_guard<std::mutex> guard(read_mutex_);
         if (fd_ < 0 || host_ == MAP_FAILED) return true;
         if (!sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)) return false;
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -275,6 +276,7 @@ public:
     }
     bool save_stopped_snapshot()
     {
+        std::lock_guard<std::mutex> guard(read_mutex_);
         if (!xr_recording_enabled() || !xr_recording_room(std::getenv("A081_QVR_OUTPUT_DIR"))) return true;
         if (spec_.id != head::RingId::pose && spec_.id != head::RingId::dl_prediction) return true;
         const char *directory = std::getenv("A081_QVR_OUTPUT_DIR");
@@ -345,6 +347,7 @@ public:
     // but do not establish a stronger atomicity contract than the OEM reader.
     bool copy_native(pose_output::PoseSnapshot &out, std::uint32_t &status)
     {
+        std::lock_guard<std::mutex> guard(read_mutex_);
         if(spec_.id!=head::RingId::pose) return false;
         status=A081_POSE_CHANGED_DURING_COPY;
         for(unsigned attempt=0;attempt<3;++attempt) {
@@ -359,6 +362,7 @@ public:
                 std::atomic_thread_fence(std::memory_order_acquire);
                 for(std::size_t i=0;i<confirm.size();++i) confirm[i]=slot[i];
             }
+            std::atomic_thread_fence(std::memory_order_acquire);
             const auto last=__atomic_load_n(index,__ATOMIC_ACQUIRE);
             if(!sync(DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ)) return false;
             if(first>=spec_.count) { status=A081_POSE_BAD_INDEX;return true; }
@@ -371,9 +375,55 @@ public:
         }
         return true;
     }
+    bool query_history(std::uint64_t query_qtimer_ns,controller::NativeHeadPose &out)
+    {
+        std::lock_guard<std::mutex> guard(read_mutex_);
+        ++history_queries_;
+        if(spec_.id!=head::RingId::pose || !query_qtimer_ns) { ++history_unavailable_;return false; }
+        // Same native no-generation boundary as latest(). The immutable copy
+        // covers the complete original history, not an AP sampling cache.
+        for(unsigned attempt=0;attempt<3;++attempt) {
+            if(!sync(DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ)) { ++history_io_errors_;return false; }
+            const auto *base=static_cast<const std::uint8_t *>(host_);
+            const auto *index=reinterpret_cast<const std::uint32_t *>(base+spec_.index);
+            const auto first=__atomic_load_n(index,__ATOMIC_ACQUIRE);
+            std::array<std::uint8_t,pose_output::pose_ring_bytes> snapshot{};
+            std::memcpy(snapshot.data(),&first,sizeof(first));
+            const volatile std::uint8_t *records=base+spec_.offset;
+            for(std::size_t i=pose_output::header_bytes;i<snapshot.size();++i)
+                snapshot[i]=records[i-pose_output::header_bytes];
+            pose_output::PoseSnapshot selected{};
+            const auto decoded=pose_output::decode_historical_pose_snapshot(snapshot.data(),snapshot.size(),
+                                                                             query_qtimer_ns,selected);
+            std::array<std::uint8_t,pose_output::pose_slot_bytes> confirm{};
+            if(decoded==pose_output::DecodeStatus::ok) {
+                const volatile std::uint8_t *record=records+selected.published_index*spec_.element;
+                for(std::size_t i=0;i<confirm.size();++i) confirm[i]=record[i];
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const auto last=__atomic_load_n(index,__ATOMIC_ACQUIRE);
+            if(!sync(DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ)) { ++history_io_errors_;return false; }
+            if(first!=last) { ++history_interference_;continue; }
+            if(decoded!=pose_output::DecodeStatus::ok) { ++history_unavailable_;return false; }
+            const auto *copy=snapshot.data()+pose_output::header_bytes+selected.published_index*spec_.element;
+            if(!std::equal(confirm.begin(),confirm.end(),copy)) { ++history_interference_;continue; }
+            out.sample_qtimer_ns=selected.timestamp_ns;
+            out.position=selected.translation;out.orientation_xyzw=selected.rotation_xyzw;
+            ++history_returned_;return true;
+        }
+        ++history_unavailable_;return false;
+    }
     void retain_until_process_exit() { retained_ = true; }
     bool release()
     {
+        std::lock_guard<std::mutex> guard(read_mutex_);
+        if(history_queries_) {
+            report("native_history_summary",{},"queries="+std::to_string(history_queries_)+
+                " returned="+std::to_string(history_returned_)+" unavailable="+std::to_string(history_unavailable_)+
+                " observed_interference="+std::to_string(history_interference_)+" io_errors="+std::to_string(history_io_errors_)+
+                " source=original80slotRing1 sample_epoch=unchanged generation=absent");
+            history_queries_=0;
+        }
         if (retained_) return false;
         bool ok = true;
         if (host_ != MAP_FAILED) {
@@ -401,6 +451,8 @@ private:
         if (rc != 0) report("ring_cpu_sync", sysresult(rc), detail() + " flags=" + std::to_string(flags));
         return rc == 0;
     }
+    std::mutex read_mutex_;
+    std::uint64_t history_queries_{},history_returned_{},history_unavailable_{},history_interference_{},history_io_errors_{};
     RingSpec spec_{};
     int fd_ = -1;
     void *host_ = MAP_FAILED;
@@ -447,8 +499,8 @@ private:
 // native adsp_imu/QDI thread alone runs HRP; this reader never feeds the DSP.
 class NativePoseReader {
 public:
-    NativePoseReader(DirectImuInput &input,Ring &pose,TrackingServer &stream,VisualInput *visual)
-        : input_(input),pose_(pose),stream_(stream),visual_(visual) {}
+    NativePoseReader(DirectImuInput &input,Ring &pose,TrackingServer &stream)
+        : input_(input),pose_(pose),stream_(stream) {}
     ~NativePoseReader() { stop(); }
     bool start(const std::array<int,3> &axes) {
         worker_=std::thread([this,axes] { run(axes); });
@@ -570,11 +622,10 @@ private:
             stream_.publish(packet);published_epoch=pose.timestamp_ns;
             ++pose_updates_;last_pose_epoch_=pose.timestamp_ns;
             while(!pending.empty() && pending.front().timestamp_ns<=published_epoch) pending.pop_front();
-            if(visual_) { visual_->controller_export.pose(packet);visual_->hand_export.pose(packet); }
         }
         wake_.notify_all();
     }
-    DirectImuInput &input_;Ring &pose_;TrackingServer &stream_;VisualInput *visual_;
+    DirectImuInput &input_;Ring &pose_;TrackingServer &stream_;
     std::thread worker_;std::atomic<bool> stopping_{false},failed_{false};
     std::atomic<std::uint64_t> latest_boot_{0},gyro_samples_{0},camera_time_{0};
     std::mutex mutex_;std::condition_variable wake_;
@@ -591,7 +642,7 @@ inline bool feed(QvrModule &module, DirectImuInput &input, Ring &pose_ring,
     const std::uint64_t max_notifications = continuous ? UINT64_MAX : (visual ? 200000 : 5000);
     std::uint64_t camera_calls=0,last_camera_time=0,last_camera_rpc_ns=0;
     std::uint64_t last_qvr_exposure_start=0,camera_short_skipped=0,camera_rate_skipped=0;
-    NativePoseReader reader(input,pose_ring,stream,visual);
+    NativePoseReader reader(input,pose_ring,stream);
     if(!reader.start(axes)) { report("native_reader_start",failure(EIO));return false; }
     bool ok=true;
     while(!interrupted && boottime_ns()<deadline && reader.samples()<max_notifications) {
@@ -817,7 +868,14 @@ inline int run(int session, const std::string &uri)
         if (ok && !interrupted) {
             const auto start_time = boottime_ns();
             ok = start_time != 0;
-            if (ok && visual) visual->start();
+            if(ok && visual) {
+                const controller::NativeHistoryQuery query=[&rings](std::uint64_t qt,controller::NativeHeadPose &out) {
+                    return rings[2].query_history(qt,out);
+                };
+                visual->controller_export.set_native_history_query(query);
+                visual->hand_export.set_native_history_query(query);
+                visual->start();
+            }
             if (ok) ok = feed(module, input, rings[2], stream, axes, start_time, visual.get());
         } else if (interrupted) {
             ok = false;
@@ -837,7 +895,9 @@ inline int run(int session, const std::string &uri)
     ok=source_stopped && ok;
     input.close();
     if (visual) {
-        visual->finish();
+        visual->finish(); // Joins capture callbacks; main hand-frame caller already ended.
+        visual->controller_export.set_native_history_query({});
+        visual->hand_export.set_native_history_query({});
         ok = visual->result.load() == 0 && ok;
         visual->groups.summary();
     }

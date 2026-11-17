@@ -94,9 +94,12 @@
     "physical_tracking": false
   },
   "controller_hand_export": {
-    "head_pose": "Real native matched epoch, CLOCK and RAW_POSE, finite nonzero quaternion normalized and finite position. No wholeflags15,quality1,state==4 or norm0.01 gate.",
-    "position_confidence": "Original HMD quality0.2 with TRACKING bit and without SUSPENDED/FATAL; this is HMD pose confidence, not a controller detector threshold.",
-    "remaining_approximation": "Previous real HMD sample within20ms of controller exposure start. The exact OEM same-epoch history query is not yet implemented; this bound is not expanded or described as original algorithm.",
-    "frame_clock_bracket": "Preserved telemetry; no5us rejection."
+    "source": "Unique NativeHistoryQuery callback reads original complete80-slot Ring1; no AP pose cache or pose() feed remains.",
+    "query": "Nonzero QCFT sof_qtimer converted by625/12 and original exposure-start correction; choose minimum absolute record+32 distance over physical slots0..79, strict< preserves first physical slot on ties. Future records are allowed; no interpolation/extrapolation/time-distance limit.",
+    "clock": "Preserve original selected sample QTimer ns. Checked signed mapping uses this same frame sample_qtimer/sample_boottime tuple. Query time and selected sample time remain distinct; no arrival timestamp is substituted.",
+    "representation": "Callback returns raw q/p/time. Exporter only checks finite position and finite nonzero quaternion and mathematically normalizes the SDK-bound local quaternion copy. No norm tolerance, quality/state or0.2 gate. Native DSP record and main240-byte raw pose are untouched.",
+    "synchronization": "Same Ring read mutex serializes DMA CPU-access intervals for stream/latest and historical callback. Full80-slot immutable copy plus selected-record/index observation detects interference, with finite3 attempts. No generation/seqlock or atomic-snapshot guarantee.",
+    "lifetime": "Bind both exporter callbacks before visual capture starts. Finish/join capture and finish main hand-frame calls, then clear callbacks before CDSP/ring teardown.",
+    "validation": "Strict ARM64 syntax, local control regression and immutable recorded raw-ring replay only; live concurrent DMA/history and SDK behavior require target verification."
   }
 }

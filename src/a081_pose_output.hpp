@@ -27,6 +27,8 @@ enum class DecodeStatus {
     null_input,
     truncated_snapshot,
     invalid_published_index,
+    invalid_query_timestamp,
+    no_timestamped_record,
 };
 
 enum class StockTrackingState : std::uint16_t {
@@ -159,6 +161,32 @@ inline DecodeStatus decode_latest_pose_snapshot(const void *snapshot, std::size_
     const auto status = detail::latest_slot(snapshot, bytes, pose_slot_bytes, index, slot);
     if (status != DecodeStatus::ok) return status;
     return decode_pose_record(slot, pose_slot_bytes, index, out);
+}
+
+// OEM historical-query semantics for nonzero camera epochs: select the
+// nearest original timestamp+32 across the entire80-slot native Ring1.
+// No interpolation, extrapolation, quality/state gate or time-distance cap.
+// Input must be an immutable CPU-coherent copy; live-reader synchronization
+// and the original no-generation publication boundary remain caller duties.
+inline DecodeStatus decode_historical_pose_snapshot(const void *snapshot,std::size_t bytes,
+                                                     std::uint64_t query_qtimer_ns,
+                                                     PoseSnapshot &out) noexcept
+{
+    if(!query_qtimer_ns) return DecodeStatus::invalid_query_timestamp;
+    std::uint32_t published{};const std::uint8_t *unused=nullptr;
+    const auto status=detail::latest_slot(snapshot,bytes,pose_slot_bytes,published,unused);
+    if(status!=DecodeStatus::ok) return status;
+    const auto *base=static_cast<const std::uint8_t *>(snapshot)+header_bytes;
+    std::uint32_t selected=published;std::uint64_t best=UINT64_MAX;bool found=false;
+    for(std::size_t n=0;n<slot_count;++n) {
+        const auto index=static_cast<std::uint32_t>(n); // Physical order; strict< keeps the first tie.
+        const auto timestamp=detail::u64(base+index*pose_slot_bytes+32);
+        if(!timestamp) continue; // Allocation contents are not a publication.
+        const auto distance=timestamp>query_qtimer_ns ? timestamp-query_qtimer_ns : query_qtimer_ns-timestamp;
+        if(!found || distance<best) { found=true;best=distance;selected=index; }
+    }
+    if(!found) return DecodeStatus::no_timestamped_record;
+    return decode_pose_record(base+selected*pose_slot_bytes,pose_slot_bytes,selected,out);
 }
 
 inline DecodeStatus decode_latest_dl_prediction_snapshot(const void *snapshot,

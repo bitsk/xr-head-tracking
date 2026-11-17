@@ -419,5 +419,12 @@
     "observed_sdk_layout": 192,
     "timestamps_strictly_advancing": true,
     "scope": "Existing original Android QVR getter; does not validate Debian concurrent ring consumer or physical coordinate mapping."
+  },
+  "historical_query": {
+    "source": "Original GetHistoricalHeadTrackingData and controller JNI GetHeadPose/setImgFrame.",
+    "semantics": "Nonzero camera epoch; select nearest timestamp+32 across native80-slot ring, including records later than query. Physical slot order0..79 with strict< tie handling. No interpolation/extrapolation,20ms cap, quality/state gate.",
+    "pure_decoder": "decode_historical_pose_snapshot(snapshot,bytes,query_qtimer_ns,out) parses an immutable complete original ring, preserving raw q/p/time. Zero query is rejected by this camera-query API.",
+    "live_boundary": "Ring::query_history owns DMA CPU sync and serialized read interval, copies full native history, verifies selected copy/index observations, and reports interference. The original ABI still has no generation.",
+    "frame_export": "Callback raw values and epoch are retained; local SDK representation checks finite p/q and nonzero q, normalizes q without norm tolerance, and maps sample epoch with same QCFT frame clock tuple."
   }
 }
