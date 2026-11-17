@@ -1,3 +1,10 @@
+xr-head-tracking (0.1.16) unstable; urgency=medium
+
+  * Report raw pose field availability and OEM confidence separately in the
+    existing motion tap; remove superseded whole-pose diagnostic gates.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 01:14:22 +0800
+
 xr-head-tracking (0.1.15) unstable; urgency=medium
 
   * Query complete original80-slot pose history by nearest nonzero camera epoch.

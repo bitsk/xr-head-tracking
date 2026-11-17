@@ -22,6 +22,31 @@ def distribution(values):
             "p95": values[int((len(values)-1)*.95)], "p99": values[int((len(values)-1)*.99)], "max": values[-1]}
 
 
+def pose_fields(data, now):
+    """Describe raw field integrity/confidence; never change or supply a pose."""
+    h = struct.unpack_from('<4I8Q', data)
+    _, _, _, flags, session, seq, gyroboot, accelboot, sample, sent, poseboot, camera = h
+    q = struct.unpack_from('<4f', data, 104)
+    quality, state, warnings, index, bracket, read = struct.unpack_from('<f5I', data, 132)
+    vectors = [struct.unpack_from('<3f', data, o) for o in (80,92,120,168,180,192,204,216,228)]
+    norm = sum(x*x for x in q)
+    checks = {'source_flags': flags & 7 == 7 and not flags & ~15,
+              'session_identity': bool(session and seq and accelboot), 'copied': read == 1,
+              'index': index < 80, 'pose_epoch': 0 < poseboot == gyroboot,
+              'clock_causality': 0 < sample <= sent <= now,
+              'orientation_representation': all(math.isfinite(x) for x in q) and math.isfinite(norm) and norm > 0}
+    rotation = all(checks.values())
+    tracked = bool(state & 4) and not state & (2 | 8)
+    finite3 = lambda v: all(math.isfinite(x) for x in v)
+    fields = {'orientation_available': rotation,
+              'orientation_tracked': rotation and tracked,
+              'position_available': rotation and finite3(vectors[7]),
+              'position_tracked': rotation and tracked and finite3(vectors[7]) and math.isfinite(quality) and quality >= .2,
+              'angular_velocity_available': rotation and finite3(vectors[3]),
+              'linear_velocity_available': rotation and finite3(vectors[8])}
+    return h, checks, fields, vectors, state, bracket
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--socket', required=True)
@@ -31,10 +56,11 @@ def main():
     if not 1 <= a.seconds <= 120:
         p.error('--seconds must be in 1..120')
     a.output.mkdir(parents=True, exist_ok=True)
-    stats, gates = collections.defaultdict(list), collections.Counter()
+    stats, failures = collections.defaultdict(list), collections.Counter()
+    field_counts, states = collections.Counter(), collections.Counter()
     previous = None
     started = time.monotonic_ns()
-    count = valid = session_changes = sequence_gaps = non_monotonic = 0
+    count = session_changes = sequence_gaps = non_monotonic = 0
     error = None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as s, (a.output/'packets.bin').open('wb') as raw:
@@ -51,21 +77,11 @@ def main():
                 raw.write(struct.pack('<Q', now) + data)
                 count += 1
                 _, _, _, flags, session, seq, gyroboot, accelboot, sample, sent, poseboot, camera = h
-                q = struct.unpack_from('<4f', data, 104)
-                quality, state, warnings, index, bracket, read = struct.unpack_from('<f5I', data, 132)
-                vectors = [struct.unpack_from('<3f', data, o) for o in (80,92,120,168,180,192,204,216,228)]
-                checks = {'flags': flags == 15, 'copied': read == 1, 'quality': quality == 1,
-                          'tracking_state': state == 4, 'index': index < 80,
-                          'pose_time': poseboot == gyroboot,
-                          'camera_age': 0 < camera <= gyroboot and gyroboot-camera < 100_000_000,
-                          'sample_age': 0 < sample <= sent <= now and now-sample < 100_000_000,
-                          'clock_bracket': bracket <= 50_000,
-                          'finite': all(math.isfinite(x) for v in vectors+[q] for x in v),
-                          'quaternion_norm': abs(sum(x*x for x in q)-1) <= .01}
+                _, checks, fields, vectors, state, bracket = pose_fields(data, now)
                 for key, ok in checks.items():
-                    if not ok: gates[key] += 1
-                ok = all(checks.values())
-                valid += int(ok)
+                    if not ok: failures[key] += 1
+                field_counts.update({key: int(value) for key, value in fields.items()})
+                states[state] += 1
                 stats['observer_sample_age_ms'].append((now-sample)/1e6)
                 stats['producer_to_tap_ms'].append((now-sent)/1e6)
                 stats['sample_to_send_ms'].append((sent-sample)/1e6)
@@ -77,18 +93,20 @@ def main():
                 elif previous:
                     session_changes += 1
                 previous = session, seq, sample
-                if ok:
-                    stats['valid_angular_speed_rad_s'].append(math.sqrt(sum(x*x for x in vectors[3])))
-                    stats['valid_linear_speed_m_s'].append(math.sqrt(sum(x*x for x in vectors[8]))/1.021)
+                if fields['angular_velocity_available']:
+                    stats['available_angular_speed_rad_s'].append(math.sqrt(sum(x*x for x in vectors[3])))
+                if fields['linear_velocity_available']:
+                    stats['available_linear_speed_m_s'].append(math.sqrt(sum(x*x for x in vectors[8]))/1.021)
     except Exception as e:
         error = str(e)
-    report = {'schema': 1, 'clock': 'CLOCK_MONOTONIC', 'wire_version': 2, 'record_bytes': 248,
-              'seconds': (time.monotonic_ns()-started)/1e9, 'packets': count, 'valid_raw_6dof': valid,
-              'rejected_gates': dict(gates), 'session_changes': session_changes,
+    report = {'schema': 2, 'clock': 'CLOCK_MONOTONIC', 'wire_version': 2, 'record_bytes': 248,
+              'seconds': (time.monotonic_ns()-started)/1e9, 'packets': count,
+              'field_packets': dict(field_counts), 'orientation_integrity_failures': dict(failures),
+              'oem_tracking_states': dict(states), 'session_changes': session_changes,
               'sequence_gaps': sequence_gaps, 'non_monotonic_samples': non_monotonic,
               'statistics': {k: distribution(v) for k,v in stats.items()}, 'error': error,
               'prediction_owner': 'SteamVR; observer performs no prediction',
-              'scope': 'raw producer tap, not bridge output; no physical motion or MTP acceptance'}
+              'scope': 'raw producer field integrity/confidence, not runtime acceptance or freshness; no physical motion or MTP acceptance'}
     (a.output/'summary.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report))
     if error:
