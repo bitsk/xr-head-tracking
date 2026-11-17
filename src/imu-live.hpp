@@ -776,8 +776,8 @@ inline int run(int session, const std::string &uri)
     const bool vr700 = device == "vr700";
     const char *cvp_option = std::getenv("A081_QVR_CVP_MODE");
     const std::string cvp_mode = cvp_option ? cvp_option : "stock";
-    if ((cvp_mode != "stock" && cvp_mode != "disabled") || (vr700 && cvp_mode != "stock")) {
-        report("imu_live_gate", failure(EINVAL), "A081_QVR_CVP_MODE must be stock or disabled; VR700 requires stock");
+    if (cvp_mode != "stock" && cvp_mode != "disabled") {
+        report("imu_live_gate", failure(EINVAL), "A081_QVR_CVP_MODE must be stock or disabled");
         return 2;
     }
     // The stock parser and Tracker3_5Core branches support this exact XML
@@ -788,16 +788,16 @@ inline int run(int session, const std::string &uri)
         : "aeef461d9ac5b191f0d2c3e83de3a5d45f305b0f7286c8fc4c5bcecb3b612db9";
     const char *calibration_hash = "eeee483e5ac268a85cd2b6ba69241bb951612045fe05d61de2f35301d816ac00";
     if (vr700) {
-        // The shipped VR700 trinity config is byte-identical to the pinned
-        // stock XML above. Keep that allowlist; the profile cannot replace it
-        // with an arbitrary modified config. Calibration is per device and
+        // VR700 ships the same tracker, CVP DSP library and stock XML as
+        // the analyzed algorithm. Both exact XML variants use its existing
+        // CvpConfig.enable branch. Calibration is per device and
         // its expected digest comes from the private imported session profile.
         const char *profile_config_hash = std::getenv("XR_HEAD_CONFIG_SHA256");
         calibration_hash = std::getenv("XR_HEAD_CALIBRATION_SHA256");
         if (!profile_config_hash || std::strcmp(profile_config_hash, config_hash) ||
             !calibration_hash || std::strlen(calibration_hash) != 64 ||
             std::strspn(calibration_hash, "0123456789abcdef") != 64) {
-            report("imu_live_gate", failure(EINVAL), "VR700 requires the pinned stock config digest and a private calibration digest");
+            report("imu_live_gate", failure(EINVAL), "VR700 requires the pinned config variant digest and a private calibration digest");
             return 2;
         }
         std::string compatible;

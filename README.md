@@ -34,15 +34,17 @@ DSP runtime 和型号默认 config6 已归档到独立公开 [xr-vendor-assets](
 `XR_DEVICE` 默认为 `a081`，保留原有型号与 XML 摘要校验。VR700 会话显式设置
 `XR_DEVICE=vr700`；生产者要求本机设备树同时具有 `VR700` 型号和
 `iqiyi,vr700` 首项 compatible。`A081_QVR_CONFIG6` 与
-`A081_QVR_CALIBRATION` 继续作为共享接口字段，分别指向原厂 trinity 配置和
+`A081_QVR_CALIBRATION` 继续作为共享接口字段，分别指向已选定的 trinity 配置变体和
 本机私有标定。会话从已导入的私有 profile 传入
 `XR_HEAD_CONFIG_SHA256`、`XR_HEAD_CALIBRATION_SHA256`，后者必须是完整的小写
 SHA-256；生产者在任何 DSP/采集操作前验证文件摘要。VR700 的 config 摘要还必须
-匹配内置的原厂白名单，不接受 profile 指定的任意修改配置。原厂 trinity 配置与
-现有 stock 配置字节相同，因此共享同一白名单值。
+匹配所选模式的内置白名单，不接受 profile 指定的任意修改配置。
 
-VR700 仅允许 `A081_QVR_CVP_MODE=stock`，未设置时也采用 stock；不沿用 MIX 的
-disabled 变体。私有标定摘要不会编入公共源码，也不会回退到 MIX 标定。型号接入
+VR700 允许 `A081_QVR_CVP_MODE=stock` 或显式 `disabled`，默认仍为 stock。
+原厂 tracker、CVP DSP 库和 XML 与已有分支分析的输入逐字节相同；disabled 仅在
+`SFConfig` 内增加 `<CvpConfig enable="false" />`，并校验对应的固定摘要。
+这会选择原算法已有的非 CVP 初始化分支，不提供模拟的 CVP 服务。
+私有标定摘要不会编入公共源码，也不会回退到 MIX 标定。型号接入
 保留原有 direct IMU、QCFT 相机、时钟与失效条件；通过文件校验不代表已经完成
 VR700 DSP、四路采集、坐标或真实跟踪验收。
 
