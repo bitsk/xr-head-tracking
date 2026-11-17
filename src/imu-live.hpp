@@ -8,14 +8,11 @@
 #include <xr/device/a081_camera_capture.hpp>
 #include <xr/device/a081_camera_groups.hpp>
 #include "a081_tracking_server.hpp"
-#include <xr/head/production-v2/a081_imu_history.h>
 #include <xr/device/see_low_latency.hpp>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <condition_variable>
 #include <memory>
-#include <sys/vfs.h>
-#include <linux/magic.h>
 #include <xr/device/a081_controller_frame_export.hpp>
 
 #include <algorithm>
@@ -176,6 +173,8 @@ struct Sample {
     std::uint64_t time{};
     std::array<float, 3> value{};
     bool gyro{};
+    xr::see::Packet source{}; // Original native record and measured clock tuple.
+    std::uint64_t qtimer_ns() const { return xr::see::get64(source.event,16); }
 };
 #include "see-input.hpp"
 
@@ -186,14 +185,15 @@ struct RingSpec {
 // AP descriptor rows in service-layout-constants.json; allocation sizes from
 // stock ELF block table base0x136004 + block_id*28. Frame block21 is16384,
 // debug block3 is10485760, prediction block12 is4096, DL block39 is12288.
-inline constexpr std::array<RingSpec, 7> ring_specs{{
+inline constexpr std::array<RingSpec, 8> ring_specs{{
     {head::RingId::health, 8192, 6816, 0, 6816, 1, 7},
-    {head::RingId::raw_gyro, 4096, 512, 0, 64, 8, 2},
+    {head::RingId::raw_gyro, 4096, 0, 64, 64, 8, 1},
     {head::RingId::pose, 16384, 0, 64, 192, 80, 0},
     {head::RingId::frame_pose, 16384, 0, 64, 64, 80, 10},
     {head::RingId::debug_6dof, 10485760, 4096, 0, 4096, 1, 4},
     {head::RingId::predicted_pose, 4096, 0, 64, 192, 8, 8},
     {head::RingId::dl_prediction, 12288, 0, 64, 128, 80, 15},
+    {head::RingId::raw_accel, 4096, 0, 64, 64, 8, 1},
 }};
 
 class Ring {
@@ -232,24 +232,15 @@ public:
                " offset=" + std::to_string(spec_.offset) + " element=" + std::to_string(spec_.element) +
                " count=" + std::to_string(spec_.count) + " type=" + std::to_string(spec_.type);
     }
-    bool publish(unsigned slot, const Sample &gyro, const Sample &accel)
+    // Takes ownership of an SCM_RIGHTS reference to the actual SEE DMA-buf.
+    // The SDSP source already initialized it. Never clear or repack its bytes.
+    bool import(int fd, RingSpec spec)
     {
-        if (spec_.id != head::RingId::raw_gyro || slot >= 8 || !sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE)) return false;
-        head::ExternalSensorRecord64 record{};
-        record.gyro_time_ns = gyro.time;
-        record.accel_time_ns = accel.time;
-        std::copy(gyro.value.begin(), gyro.value.end(), record.gyro);
-        std::copy(accel.value.begin(), accel.value.end(), record.accel);
-        auto *base = static_cast<std::uint8_t *>(host_);
-        std::memcpy(base + slot * 64, &record, sizeof(record));
-        // These allocations are FastRPC dma_alloc_coherent/dma_mmap_coherent,
-        // not arbitrary imported cached buffers. The DMA-buf CPU-access pair
-        // plus release ordering precedes the DSP's explicit cache invalidates.
-        std::atomic_thread_fence(std::memory_order_release);
-        const std::uint32_t index = slot;
-        std::memcpy(base + spec_.index, &index, sizeof(index));
-        std::atomic_thread_fence(std::memory_order_release);
-        return sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        if(fd<0 || spec.bytes!=xr::see::allocation_bytes) return false;
+        spec_=spec;fd_=fd;
+        host_=mmap(nullptr,spec.bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd_,0);
+        report("ring_import",host_==MAP_FAILED ? failure(errno) : Result{},detail());
+        return host_!=MAP_FAILED;
     }
     bool summary(const char *when)
     {
@@ -348,50 +339,36 @@ public:
         }
         return ok;
     }
-    // Called only by the sole external-IMU/QVR RPC caller, after method10
-    // returns and before any next IMU/camera call. Method10 runs the writer
-    // synchronously; this path never registers native Android direct channels.
-    // Copy equality/index checks detect unexpected changes, not a seqlock.
-    // A missing update is explicit and does not suppress the real IMU packet.
-    bool copy_after_notification(std::uint64_t gyro_time, a081_tracking_packet &packet)
+    // Original native writer cleans a completed slot before publishing its
+    // wrapping index. Select only that published slot. Equal indexes are not
+    // a generation/seqlock: copy comparisons detect observed interference,
+    // but do not establish a stronger atomicity contract than the OEM reader.
+    bool copy_native(pose_output::PoseSnapshot &out, std::uint32_t &status)
     {
-        if (spec_.id != head::RingId::pose) return false;
-        if (!sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)) return false;
-        std::atomic_thread_fence(std::memory_order_acquire);
-        const auto *base = static_cast<const std::uint8_t *>(host_);
-        std::uint32_t first = 0, last = 0;
-        std::memcpy(&first, base + spec_.index, sizeof(first));
-        std::array<std::uint8_t, pose_output::pose_slot_bytes> copy{}, confirm{};
-        if (first < spec_.count) {
-            const auto *slot = base + spec_.offset + first * spec_.element;
-            std::memcpy(copy.data(), slot, copy.size());
-            std::atomic_thread_fence(std::memory_order_acquire);
-            std::memcpy(confirm.data(), slot, confirm.size());
+        if(spec_.id!=head::RingId::pose) return false;
+        status=A081_POSE_CHANGED_DURING_COPY;
+        for(unsigned attempt=0;attempt<3;++attempt) {
+            if(!sync(DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ)) return false;
+            const auto *base=static_cast<const std::uint8_t *>(host_);
+            const auto *index=reinterpret_cast<const std::uint32_t *>(base+spec_.index);
+            const auto first=__atomic_load_n(index,__ATOMIC_ACQUIRE);
+            std::array<std::uint8_t,pose_output::pose_slot_bytes> copy{},confirm{};
+            if(first<spec_.count) {
+                const volatile std::uint8_t *slot=base+spec_.offset+first*spec_.element;
+                for(std::size_t i=0;i<copy.size();++i) copy[i]=slot[i];
+                std::atomic_thread_fence(std::memory_order_acquire);
+                for(std::size_t i=0;i<confirm.size();++i) confirm[i]=slot[i];
+            }
+            const auto last=__atomic_load_n(index,__ATOMIC_ACQUIRE);
+            if(!sync(DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ)) return false;
+            if(first>=spec_.count) { status=A081_POSE_BAD_INDEX;return true; }
+            if(first!=last || copy!=confirm) continue;
+            pose_output::PoseSnapshot pose{};
+            if(pose_output::decode_pose_record(copy.data(),copy.size(),first,pose)!=pose_output::DecodeStatus::ok)
+                return false;
+            if(!pose.timestamp_ns) { status=A081_POSE_NOT_READ;return true; }
+            out=pose;status=A081_POSE_COPIED;return true;
         }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        std::memcpy(&last, base + spec_.index, sizeof(last));
-        if (!sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ)) return false;
-        packet.pose_index = first;
-        if (first >= spec_.count) { packet.pose_read_status = A081_POSE_BAD_INDEX; return true; }
-        if (first != last || copy != confirm) { packet.pose_read_status = A081_POSE_CHANGED_DURING_COPY; return true; }
-        pose_output::PoseSnapshot pose;
-        if (pose_output::decode_pose_record(copy.data(), copy.size(), first, pose) != pose_output::DecodeStatus::ok)
-            return false;
-        if (pose.timestamp_ns != gyro_time) { packet.pose_read_status = A081_POSE_TIMESTAMP_MISMATCH; return true; }
-        packet.pose_read_status = A081_POSE_COPIED;
-        packet.flags |= A081_TRACKING_RAW_POSE;
-        packet.pose_boottime_ns = pose.timestamp_ns;
-        std::copy(pose.rotation_xyzw.begin(), pose.rotation_xyzw.end(), packet.rotation_xyzw);
-        std::copy(pose.translation.begin(), pose.translation.end(), packet.translation);
-        std::copy(pose.angular_s.begin(), pose.angular_s.end(), packet.angular_s);
-        std::copy(pose.angular_b.begin(), pose.angular_b.end(), packet.angular_b);
-        std::copy(pose.angular_bdt.begin(), pose.angular_bdt.end(), packet.angular_bdt);
-        std::copy(pose.angular_bdt2.begin(), pose.angular_bdt2.end(), packet.angular_bdt2);
-        std::copy(pose.translation_s.begin(), pose.translation_s.end(), packet.translation_s);
-        std::copy(pose.translation_b.begin(), pose.translation_b.end(), packet.translation_b);
-        packet.pose_quality = pose.pose_quality;
-        packet.tracking_state = pose.tracking_state;
-        packet.warning_flags = pose.warning_flags;
         return true;
     }
     void retain_until_process_exit() { retained_ = true; }
@@ -431,92 +408,6 @@ private:
     bool have_baseline_{}, retained_{};
 };
 
-// Drain the sole device-io direct stream independently of the serialized OEM RPC loop.
-// The OEM still receives every ordered sample; the presentation path can read
-// the real gyro history while camera_frame_from_sof is blocked in FastRPC.
-class LiveImuReader {
-public:
-    ~LiveImuReader() { stop(); }
-    bool start(DirectImuInput &input, const std::array<int, 3> &axes, const char *path)
-    {
-        if (std::strncmp(path, "/run/", 5)) return false;
-        const char *group = std::getenv("A081_QVR_IMU_READER_GID");
-        char *end = nullptr;
-        unsigned long gid = group ? std::strtoul(group, &end, 10) : 0;
-        if (!group || !*group || *end || gid > UINT32_MAX) return false;
-        fd_ = ::open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (fd_ < 0) return false;
-        path_ = path;
-        struct statfs fs{};
-        if (fstatfs(fd_, &fs) || fs.f_type != TMPFS_MAGIC ||
-            ftruncate(fd_, sizeof(a081_imu_history)) || fchown(fd_, geteuid(), gid) || fchmod(fd_, 0640)) return false;
-        void *mapping = mmap(nullptr, sizeof(a081_imu_history), PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (mapping == MAP_FAILED) return false;
-        history_ = static_cast<a081_imu_history *>(mapping);
-        a081_imu_store(&history_->magic, A081_IMU_HISTORY_MAGIC);
-        if (!input.connect()) return false;
-        worker_ = std::thread([this, &input, axes] {
-            while (!stop_.load()) {
-                pollfd descriptor{input.fd(), POLLIN, 0};
-                const int ready = poll(&descriptor, 1, 10);
-                if (ready < 0 && errno == EINTR) continue;
-                if (ready < 0) { fail(); break; }
-                if (!ready) continue;
-                std::vector<Sample> batch;
-                bool ok = true;
-                if (descriptor.revents & (POLLERR|POLLHUP|POLLNVAL)) ok=false;
-                if (ok && (descriptor.revents & POLLIN)) ok=input.read_batch(batch,axes);
-                if (!ok) { fail(); break; }
-                for (const auto &sample : batch) if (sample.gyro) {
-                    const auto before=TrackingServer::now(CLOCK_MONOTONIC);
-                    const auto boot=TrackingServer::now(CLOCK_BOOTTIME);
-                    const auto after=TrackingServer::now(CLOCK_MONOTONIC);
-                    if (before && after>=before && after-before<=A081_TRACKING_MAX_BRACKET_NS &&
-                        boot>=sample.time && boot-sample.time<A081_TRACKING_MAX_AGE_NS) {
-                        const auto mono=before+(after-before)/2;
-                        if (mono>boot-sample.time) a081_imu_append(history_,mono-(boot-sample.time),sample.value.data());
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (queue_.size()+batch.size()>1024) { failed_=true; wake_.notify_all(); break; }
-                    queue_.insert(queue_.end(),batch.begin(),batch.end());
-                }
-                wake_.notify_one();
-            }
-        });
-        return true;
-    }
-    bool take(std::vector<Sample> &batch)
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        wake_.wait_for(lock,std::chrono::milliseconds(20),[this] { return failed_ || !queue_.empty(); });
-        if (failed_) return false;
-        batch.assign(queue_.begin(),queue_.end()); queue_.clear();
-        return true;
-    }
-    bool pending() { std::lock_guard<std::mutex> lock(mutex_); return !queue_.empty(); }
-    void stop()
-    {
-        stop_.store(true);
-        if (worker_.joinable()) worker_.join();
-        if (history_) { a081_imu_store(&history_->magic,0); munmap(history_,sizeof(a081_imu_history)); history_=nullptr; }
-        if (fd_>=0) { ::close(fd_); fd_=-1; }
-        if (!path_.empty()) { unlink(path_.c_str()); path_.clear(); }
-    }
-private:
-    void fail() { std::lock_guard<std::mutex> lock(mutex_); failed_=true; wake_.notify_all(); }
-    int fd_=-1;
-    std::string path_;
-    a081_imu_history *history_=nullptr;
-    std::atomic<bool> stop_{false};
-    std::thread worker_;
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    std::deque<Sample> queue_;
-    bool failed_=false;
-};
-
 class VisualInput {
 public:
     explicit VisualInput(std::uint64_t exposure_ns)
@@ -552,7 +443,145 @@ private:
     std::thread worker;
 };
 
-inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pose_ring,
+// AP publication is independent of the camera RPC caller. QVR's original
+// native adsp_imu/QDI thread alone runs HRP; this reader never feeds the DSP.
+class NativePoseReader {
+public:
+    NativePoseReader(DirectImuInput &input,Ring &pose,TrackingServer &stream,VisualInput *visual)
+        : input_(input),pose_(pose),stream_(stream),visual_(visual) {}
+    ~NativePoseReader() { stop(); }
+    bool start(const std::array<int,3> &axes) {
+        worker_=std::thread([this,axes] { run(axes); });
+        if(input_.start()) return true;
+        failed_=true;stop();return false;
+    }
+    void stop() {
+        stopping_=true;wake_.notify_all();
+        if(worker_.joinable()) worker_.join();
+    }
+    bool wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait_for(lock,std::chrono::milliseconds(20));
+        return !failed_.load();
+    }
+    std::uint64_t latest_time() const { return latest_boot_.load(); }
+    std::uint64_t samples() const { return gyro_samples_.load(); }
+    void camera_submitted(std::uint64_t time) { camera_time_=time; }
+    void summary() const {
+        std::cout << "stage=native_pose_reads copied=" << reads_[A081_POSE_COPIED]
+                  << " bad_index=" << reads_[A081_POSE_BAD_INDEX]
+                  << " changed=" << reads_[A081_POSE_CHANGED_DURING_COPY]
+                  << " timestamp_unmatched=" << reads_[A081_POSE_TIMESTAMP_MISMATCH]
+                  << " not_ready=" << reads_[A081_POSE_NOT_READ]
+                  << " missing_input=" << missing_input_ << " association_waits=" << unmatched_
+                  << " pose_updates=" << pose_updates_ << " last_pose_qtimer_ns=" << last_pose_epoch_
+                  << " producer_error=" << failed_.load()
+                  << " input_capacity=" << xr::see::native_capacity
+                  << " consistency=OEM_published_slot_no_generation physical_validated=0" << std::endl;
+    }
+private:
+    void run(const std::array<int,3> &axes) {
+        std::deque<Sample> history[2];
+        std::deque<pose_output::PoseSnapshot> pending;
+        std::uint64_t observed_epoch=0,published_epoch=0;
+        while(!stopping_.load()) {
+            pollfd descriptor{input_.fd(),POLLIN,0};
+            const int ready=poll(&descriptor,1,10);
+            if(ready<0 && errno==EINTR) continue;
+            if(ready<0 || ((descriptor.revents&(POLLERR|POLLHUP|POLLNVAL)) && !(descriptor.revents&POLLIN))) {
+                failed_=true;break;
+            }
+            if(!ready) continue;
+            std::vector<Sample> batch;
+            if(!input_.read_batch(batch,axes)) { failed_=true;break; }
+            for(const auto &sample:batch) {
+                auto &cache=history[sample.gyro ? 1 : 0];cache.push_back(sample);
+                // Exactly the original 4096/104 native input capacity; no
+                // additional motion, age, quality or prediction threshold.
+                while(cache.size()>xr::see::native_capacity) cache.pop_front();
+                if(sample.gyro) {
+                    ++gyro_samples_;latest_boot_=sample.time;
+                }
+            }
+            wake_.notify_one();
+            const auto samples=gyro_samples_.load();
+            if(samples && (last_progress_group_==UINT64_MAX ||
+                (xr_diagnostic_logs_enabled() && samples/xr::see::native_capacity!=last_progress_group_))) {
+                last_progress_group_=samples/xr::see::native_capacity;
+                report("native_pose_progress",{},"gyro_samples="+std::to_string(samples)+
+                    " pose_updates="+std::to_string(pose_updates_)+" last_pose_qtimer_ns="+std::to_string(last_pose_epoch_)+
+                    " association_waits="+std::to_string(unmatched_)+" producer_error=0 freshness=not_inferred_from_state");
+            }
+            if(history[0].empty() || history[1].empty()) { ++missing_input_;continue; }
+            pose_output::PoseSnapshot pose{};std::uint32_t status=A081_POSE_NOT_READ;
+            if(!pose_.copy_native(pose,status)) { failed_=true;break; }
+            ++reads_.at(status);
+            if(status==A081_POSE_COPIED && pose.timestamp_ns>observed_epoch) {
+                observed_epoch=pose.timestamp_ns;pending.push_back(pose);
+                while(pending.size()>pose_output::slot_count) { pending.pop_front();++unmatched_; }
+            }
+            // QDI and AP metadata delivery are independent. Preserve real
+            // published records while their matching source event is in flight;
+            // selecting only the newest ring entry can perpetually run ahead.
+            auto selected=pending.rend();auto gyro=history[1].end();
+            for(auto candidate=pending.rbegin();candidate!=pending.rend();++candidate) {
+                if(candidate->timestamp_ns<=published_epoch) break;
+                gyro=std::find_if(history[1].begin(),history[1].end(),[&](const Sample &sample) {
+                    return sample.qtimer_ns()==candidate->timestamp_ns;
+                });
+                if(gyro!=history[1].end()) { selected=candidate;break; }
+            }
+            if(selected==pending.rend()) { ++unmatched_;continue; }
+            pose=*selected;
+            auto accel=history[0].rbegin();
+            const auto distance=[&](const Sample &sample) {
+                const auto a=sample.qtimer_ns(),g=gyro->qtimer_ns();return a>g ? a-g : g-a;
+            };
+            for(auto candidate=history[0].rbegin();candidate!=history[0].rend();++candidate)
+                if(distance(*candidate)<distance(*accel)) accel=candidate;
+            const __int128 accel_boot=static_cast<__int128>(accel->qtimer_ns())+gyro->source.qtimer_to_boottime_ns;
+            if(accel_boot<=0 || accel_boot>UINT64_MAX) { failed_=true;break; }
+            a081_tracking_packet packet{};
+            packet.flags=A081_TRACKING_IMU;
+            packet.gyro_boottime_ns=gyro->time;
+            packet.accel_boottime_ns=static_cast<std::uint64_t>(accel_boot);
+            packet.last_camera_boottime_ns=camera_time_.load();
+            if(packet.last_camera_boottime_ns) packet.flags|=A081_TRACKING_CAMERA_SUBMITTED;
+            std::copy(gyro->value.begin(),gyro->value.end(),packet.gyro);
+            std::copy(accel->value.begin(),accel->value.end(),packet.accel);
+            packet.pose_read_status=A081_POSE_COPIED;
+            {
+                packet.flags|=A081_TRACKING_RAW_POSE;
+                // SLPI VR mode writes QTimer ticks*625/12, no offset. The
+                // native DSP copies that gyro timestamp unchanged into pose.
+                // Use that record's measured mapping, never AP receive time.
+                packet.pose_boottime_ns=gyro->time;packet.pose_index=pose.published_index;
+                std::copy(pose.rotation_xyzw.begin(),pose.rotation_xyzw.end(),packet.rotation_xyzw);
+                std::copy(pose.translation.begin(),pose.translation.end(),packet.translation);
+                std::copy(pose.angular_s.begin(),pose.angular_s.end(),packet.angular_s);
+                std::copy(pose.angular_b.begin(),pose.angular_b.end(),packet.angular_b);
+                std::copy(pose.angular_bdt.begin(),pose.angular_bdt.end(),packet.angular_bdt);
+                std::copy(pose.angular_bdt2.begin(),pose.angular_bdt2.end(),packet.angular_bdt2);
+                std::copy(pose.translation_s.begin(),pose.translation_s.end(),packet.translation_s);
+                std::copy(pose.translation_b.begin(),pose.translation_b.end(),packet.translation_b);
+                packet.pose_quality=pose.pose_quality;packet.tracking_state=pose.tracking_state;
+                packet.warning_flags=pose.warning_flags;
+            }
+            stream_.publish(packet);published_epoch=pose.timestamp_ns;
+            ++pose_updates_;last_pose_epoch_=pose.timestamp_ns;
+            while(!pending.empty() && pending.front().timestamp_ns<=published_epoch) pending.pop_front();
+            if(visual_) { visual_->controller_export.pose(packet);visual_->hand_export.pose(packet); }
+        }
+        wake_.notify_all();
+    }
+    DirectImuInput &input_;Ring &pose_;TrackingServer &stream_;VisualInput *visual_;
+    std::thread worker_;std::atomic<bool> stopping_{false},failed_{false};
+    std::atomic<std::uint64_t> latest_boot_{0},gyro_samples_{0},camera_time_{0};
+    std::mutex mutex_;std::condition_variable wake_;
+    std::array<std::uint64_t,5> reads_{};std::uint64_t missing_input_{},unmatched_{},pose_updates_{},last_pose_epoch_{},last_progress_group_=UINT64_MAX;
+};
+
+inline bool feed(QvrModule &module, DirectImuInput &input, Ring &pose_ring,
                  TrackingServer &stream, const std::array<int, 3> &axes, std::uint64_t start,
                  VisualInput *visual = nullptr)
 {
@@ -560,99 +589,23 @@ inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pos
     const bool continuous = visual && continuous_value && std::string(continuous_value) == "1";
     const auto deadline = continuous ? UINT64_MAX : start + (visual ? 370000000000ULL : 5000000000ULL);
     const std::uint64_t max_notifications = continuous ? UINT64_MAX : (visual ? 200000 : 5000);
-    std::deque<Sample> accel_history;
-    std::uint64_t notified = 0, skipped = 0, first = 0, last = 0;
-    std::uint64_t camera_calls = 0, last_camera_time = 0;
-    std::uint64_t last_qvr_exposure_start = 0, camera_short_skipped = 0, camera_rate_skipped = 0;
-    // Motion A/B validation is still required: retain the production schedule
-    // by default while exposing timing telemetry for subsequent diagnosis.
-    const char *catchup_value = std::getenv("XR_HEAD_IMU_CATCHUP");
-    const bool imu_catchup = catchup_value && std::string(catchup_value) == "1";
-    std::uint64_t catchup_started_ns = 0, imu_deferrals = 0, last_camera_rpc_ns = 0;
-    std::unique_ptr<LiveImuReader> reader;
-    const char *history_path = std::getenv("A081_QVR_IMU_HISTORY");
-    if (history_path && *history_path) {
-        reader = std::make_unique<LiveImuReader>();
-        if (!reader->start(input, axes, history_path)) {
-            report("imu_reader_start", failure(errno ? errno : EINVAL)); return false;
+    std::uint64_t camera_calls=0,last_camera_time=0,last_camera_rpc_ns=0;
+    std::uint64_t last_qvr_exposure_start=0,camera_short_skipped=0,camera_rate_skipped=0;
+    NativePoseReader reader(input,pose_ring,stream,visual);
+    if(!reader.start(axes)) { report("native_reader_start",failure(EIO));return false; }
+    bool ok=true;
+    while(!interrupted && boottime_ns()<deadline && reader.samples()<max_notifications) {
+        if(!reader.wait()) { ok=false;break; }
+        if(visual && visual->done.load()) {
+            if(visual->result.load()!=0) { ok=false;break; }
+            if(visual->groups.empty()) break;
         }
-    }
-    if (!reader) { report("see_input", failure(EINVAL), "direct source requires IMU history reader"); return false; }
-    std::array<std::uint64_t, 5> pose_reads{};
-    bool ok = true;
-    while (!interrupted && boottime_ns() < deadline && notified < max_notifications) {
-        if (visual && visual->done.load()) {
-            if (visual->result.load() != 0) { ok = false; break; }
-            // Once all real camera groups are submitted, stop the producer.
-            // An extra IMU-only tail overwrites the small output ring and
-            // obscures the quality of the last camera-fed records.
-            if (visual->groups.empty()) break;
-        }
-        std::vector<Sample> batch;
-        batch.reserve(128);
-        if (!reader->take(batch)) { ok=false; break; }
-        if (batch.empty()) continue;
-        std::stable_sort(batch.begin(), batch.end(), [](const Sample &a, const Sample &b) {
-            return a.time == b.time ? a.gyro < b.gyro : a.time < b.time;
-        });
-        for (const auto &sample : batch) {
-            if (interrupted || boottime_ns() >= deadline || notified >= max_notifications) break;
-            if (!sample.gyro) {
-                accel_history.push_back(sample);
-                if (accel_history.size() > 128) accel_history.pop_front();
-                continue;
-            }
-            // Independent direct delivery may expose a newer accel before an
-            // older gyro is read. Retain real history instead of losing the
-            // previous suitable sample, or relabelling the newer timestamp.
-            const auto accel_at = std::find_if(accel_history.rbegin(), accel_history.rend(),
-                [&](const Sample &a) { return a.time <= sample.time; });
-            if (accel_at == accel_history.rend() ||
-                sample.time - accel_at->time > 100000000ULL) { ++skipped; continue; }
-            const auto &latest_accel = *accel_at;
-            if (!ring.publish(static_cast<unsigned>(notified % 8), sample, latest_accel)) { ok = false; break; }
-            const auto result = module.external_sensor_ready();
-            if (!result) { report("external_sensor_ready", result); ok = false; break; }
-            ++notified;
-            if (!first) first = sample.time;
-            last = sample.time;
-            if (stream.enabled()) {
-                a081_tracking_packet packet{};
-                packet.flags = A081_TRACKING_IMU | (camera_calls ? A081_TRACKING_CAMERA_SUBMITTED : 0);
-                packet.gyro_boottime_ns = sample.time; packet.accel_boottime_ns = latest_accel.time;
-                packet.last_camera_boottime_ns = last_camera_time;
-                std::copy(sample.value.begin(), sample.value.end(), packet.gyro);
-                std::copy(latest_accel.value.begin(), latest_accel.value.end(), packet.accel);
-                if (!pose_ring.copy_after_notification(sample.time, packet)) { ok = false; break; }
-                ++pose_reads.at(packet.pose_read_status);
-                stream.publish(packet);
-                if (visual) { visual->controller_export.pose(packet); visual->hand_export.pose(packet); }
-            }
-            if (xr_diagnostic_logs_enabled() && (notified == 1 || notified % 128 == 0)) {
-                std::lock_guard<std::mutex> log(camera::output_mutex);
-                std::cout << "stage=imu_publish rc=0 count=" << notified << " gyro_ns=" << sample.time
-                          << " accel_ns=" << latest_accel.time << " slot=" << (notified - 1) % 8
-                          << " gyro=" << sample.value[0] << ',' << sample.value[1] << ',' << sample.value[2]
-                          << " accel=" << latest_accel.value[0] << ',' << latest_accel.value[1] << ',' << latest_accel.value[2]
-                          << " batch_samples=" << batch.size() << " sample_age_ns=" << boottime_ns() - sample.time
-                          << " last_camera_rpc_ns=" << last_camera_rpc_ns << " imu_deferrals=" << imu_deferrals
-                          << " position_valid=not_evaluated" << std::endl;
-            }
-        }
-        if (!ok) break;
+        const auto last=reader.latest_time();
+        if(!last) continue;
         if (visual) {
-            // Camera RPC and IMU notifications must stay serialized. A camera
-            // call can leave several IMU samples queued; processing the batch
-            // takes more time, during which still newer samples arrive. Drain
-            // those before starting another camera RPC, with a bounded budget
-            // so a saturated IMU caller cannot starve visual localization.
-            const auto now = boottime_ns();
-            if (imu_catchup && last && now > last + 3000000ULL &&
-                reader->pending()) {
-                if (!catchup_started_ns) catchup_started_ns = now;
-                if (now - catchup_started_ns < 8000000ULL) { ++imu_deferrals; continue; }
-            }
-            catchup_started_ns = 0;
+            // The native QDI thread advances HRP independently. This
+            // caller only submits real camera groups once source time reached
+            // their capture time; it never drains or injects IMU notifications.
             camera::FrameGroup group;
             if (visual->groups.take(last, group)) {
                 head::Bytes tracking, controllers;
@@ -668,24 +621,25 @@ inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pos
                 // tracking exposure. Controller export still receives both short
                 // phases, with their real sensor frame numbers and timestamps.
                 const auto &tracking_meta = group.frames[0].timing;
-                camera::StockY8Time qvr_time{};
-                if (!camera::stock_a081_y8_time(tracking_meta.sof_boottime_ns,
+                camera::StockY8NativeTime qvr_time{};
+                if (!camera::stock_a081_y8_native_time(tracking_meta.sof_qtimer,
                         camera::frame_exposure_ns(tracking_meta, visual->exposure_ns), qvr_time)) {
                     report("camera_group", failure(EINVAL), "Invalid real tracking exposure time"); ok = false; break;
                 }
                 const bool short_phase = camera::valid_pattern_exposure(tracking_meta) &&
                     tracking_meta.exposure_phase != 2;
                 const bool rate_skip = last_qvr_exposure_start &&
-                    (qvr_time.exposure_start_boottime_ns <= last_qvr_exposure_start ||
-                     qvr_time.exposure_start_boottime_ns - last_qvr_exposure_start < 30303030ULL);
+                    (qvr_time.exposure_start_qtimer_ns <= last_qvr_exposure_start ||
+                     qvr_time.exposure_start_qtimer_ns - last_qvr_exposure_start < 30303030ULL);
                 if (short_phase || rate_skip) {
                     if (short_phase) ++camera_short_skipped; else ++camera_rate_skipped;
                     continue;
                 }
-                // Only this thread invokes QVR, after IMU has reached the
-                // camera time. Capture workers only publish bounded real data.
+                // The real QCFT SOF counter is the same19.2MHz QTimer
+                // as native IMU. Apply625/12 and original exposure arithmetic
+                // directly, avoiding a BOOTTIME/NTP conversion round trip.
                 const auto camera_begin_ns = boottime_ns();
-                const auto r = module.camera_frame_from_sof(group.frames[0].timing.sof_boottime_ns,
+                const auto r = module.camera_frame_from_qtimer_sof(group.frames[0].timing.sof_qtimer,
                     camera::frame_exposure_ns(group.frames[0].timing, visual->exposure_ns), tracking, controllers,
                     static_cast<std::int32_t>(group.frames[0].image.sequence),
                     static_cast<std::int32_t>(group.frames[2].image.sequence));
@@ -712,7 +666,8 @@ inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pos
                     std::cout << " fields=stream_id,sequence,index,cookie,sof_boottime_ns" << std::endl;
                 }
                 ++camera_calls; last_camera_time = group.submit_boottime_ns;
-                last_qvr_exposure_start = qvr_time.exposure_start_boottime_ns;
+                reader.camera_submitted(last_camera_time);
+                last_qvr_exposure_start = qvr_time.exposure_start_qtimer_ns;
                 // This same group's synchronous QVR camera RPC returned OK.
                 // It is not a global DSP-idle barrier and does not wait for
                 // hand inference; future original IMU/camera calls continue.
@@ -720,26 +675,21 @@ inline bool feed(QvrModule &module, DirectImuInput &input, Ring &ring, Ring &pos
             }
         }
     }
-    if (reader) reader->stop();
+    reader.stop();
     {
-    std::lock_guard<std::mutex> log(camera::output_mutex);
-    std::cout << "stage=imu_input_summary elapsed_ns=" << boottime_ns() - start
-              << " skipped_no_recent_accel=" << skipped << " notifications=" << notified
-              << " first_gyro_ns=" << first << " last_gyro_ns=" << last
-              << " interrupted=" << interrupted << " camera_rpc_success=" << camera_calls
-              << " camera_short_skipped=" << camera_short_skipped << " camera_rate_skipped=" << camera_rate_skipped
-              << " imu_catchup=" << imu_catchup << " imu_deferrals=" << imu_deferrals
-              << " last_camera_submit_ns=" << last_camera_time << " visual_6dof=not_validated" << std::endl;
+        std::lock_guard<std::mutex> log(camera::output_mutex);
+        reader.summary();
+        std::cout << "stage=imu_input_summary elapsed_ns=" << boottime_ns()-start
+                  << " native_gyro_samples=" << reader.samples()
+                  << " camera_rpc_success=" << camera_calls
+                  << " camera_short_skipped=" << camera_short_skipped
+                  << " camera_rate_skipped=" << camera_rate_skipped
+                  << " last_camera_submit_ns=" << last_camera_time
+                  << " last_camera_rpc_ns=" << last_camera_rpc_ns
+                  << " native_QDI_HRP=requires_device_verification" << std::endl;
     }
     input.summary();
-    if (stream.enabled()) {
-        std::cout << "stage=pose_stream_reads copied=" << pose_reads[A081_POSE_COPIED]
-                  << " bad_index=" << pose_reads[A081_POSE_BAD_INDEX]
-                  << " changed=" << pose_reads[A081_POSE_CHANGED_DURING_COPY]
-                  << " timestamp_mismatch=" << pose_reads[A081_POSE_TIMESTAMP_MISMATCH]
-                  << " openxr_position_valid=0" << std::endl;
-    }
-    return ok && !interrupted && notified > 0 && (!visual || camera_calls > 0);
+    return ok && !interrupted && reader.samples()>0 && (!visual || camera_calls>0);
 }
 
 inline int run(int session, const std::string &uri)
@@ -751,9 +701,6 @@ inline int run(int session, const std::string &uri)
     const std::array<int, 3> axes{1,2,3};
     constexpr unsigned requested_rate = 800;
     DirectImuInput input;
-    if (std::getenv("XR_HEAD_IMU_SOURCE") || std::getenv("A081_QVR_IMU_HZ")) {
-        report("imu_live_gate", failure(EINVAL), "obsolete source/rate override: this build uses stock direct 800 Hz"); return 2;
-    }
     std::unique_ptr<VisualInput> visual;
     if (const char *option = std::getenv("A081_QVR_VISUAL")) {
         const char *value = std::getenv("A081_QVR_CAMERA_EXPOSURE_NS");
@@ -822,7 +769,7 @@ inline int run(int session, const std::string &uri)
               << " continuous_requested=" << (std::getenv("A081_QVR_CONTINUOUS") ? std::getenv("A081_QVR_CONTINUOUS") : "0")
               << " actual_frequency=reported_per_stream RPC_calls=synchronous_external_process_timeout_still_required" << std::endl;
     Signals signals;
-    std::array<Ring, 7> rings;
+    std::array<Ring, 8> rings;
     TrackingServer stream;
     QvrModule module(session);
     bool opened = false, initialized = false, ok = true, safe_to_release = true;
@@ -837,7 +784,12 @@ inline int run(int session, const std::string &uri)
         ok = ok && signals.install();
         if (ok) { const auto r = module.open(uri, message); report("open", r, message); opened = ok = static_cast<bool>(r); }
         if (ok) { const auto r = module.driver_version(message); report("driver_version", r, message); ok = static_cast<bool>(r); }
-        for (std::size_t i = 0; ok && i < rings.size(); ++i) ok = rings[i].allocate(session, ring_specs[i]);
+        if(ok) ok=input.connect();
+        for(std::size_t i=0;ok && i<rings.size();++i) {
+            if(ring_specs[i].id==head::RingId::raw_gyro) ok=rings[i].import(input.take_buffer(1),ring_specs[i]);
+            else if(ring_specs[i].id==head::RingId::raw_accel) ok=rings[i].import(input.take_buffer(0),ring_specs[i]);
+            else ok=rings[i].allocate(session,ring_specs[i]);
+        }
         if (ok) { const auto r = module.init(); report("init", r); initialized = ok = static_cast<bool>(r); }
         if (ok) { const auto r = module.tracker_version(message); report("tracker_version", r, message); ok = static_cast<bool>(r); }
         for (std::size_t i = 0; ok && i < rings.size(); ++i) {
@@ -851,7 +803,7 @@ inline int run(int session, const std::string &uri)
         if (ok) {
             std::uint64_t ticks = 0;
             const auto r = module.qtimer_ticks(ticks);
-            report("qtimer_ticks", r, "raw_ticks=" + std::to_string(ticks) + " external IMU retains BOOTTIME");
+            report("qtimer_ticks", r, "raw_ticks=" + std::to_string(ticks) + " native sensor/pose use QTimer ns");
             ok = static_cast<bool>(r);
         }
         // QVR DSP start ELF0x7a3c only calls set_cvp_fds if camera_fds_len>0.
@@ -866,7 +818,7 @@ inline int run(int session, const std::string &uri)
             const auto start_time = boottime_ns();
             ok = start_time != 0;
             if (ok && visual) visual->start();
-            if (ok) ok = feed(module, input, rings[1], rings[2], stream, axes, start_time, visual.get());
+            if (ok) ok = feed(module, input, rings[2], stream, axes, start_time, visual.get());
         } else if (interrupted) {
             ok = false;
         }
@@ -878,7 +830,12 @@ inline int run(int session, const std::string &uri)
     }
     // EOF invalidates consumers before DSP stop/deinit and direct-stream closure.
     { std::lock_guard<std::mutex> log(camera::output_mutex); stream.close(); }
-    input.close(); // stop SDSP acquisition before the longer CDSP teardown
+    // Stop and acknowledge the source before CDSP teardown. Imported fd
+    // references remain in rings until every borrowed DSP mapping is released.
+    const bool source_stopped=input.stop();
+    report("native_source_stop",source_stopped ? Result{} : failure(EIO));
+    ok=source_stopped && ok;
+    input.close();
     if (visual) {
         visual->finish();
         ok = visual->result.load() == 0 && ok;

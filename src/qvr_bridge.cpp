@@ -219,16 +219,6 @@ Result QvrModule::stop()
     return result;
 }
 
-Result QvrModule::external_sensor_ready()
-{
-    if (!initialized_ || !started_) return local_failure(EINVAL);
-    // DSP ELF0x87a4 -> FUN_000187b0(0), invalidates ring0 header/current64B
-    // record and dispatches onSensorData_6Dof when mode==1. This wrapper in the
-    // stock DSP returns zero even when the void helper exits without a pose.
-    head::Invocation call{head::qvr_method::external_sensor_ready, {}, {}};
-    return invoke(fd_, handle_, call);
-}
-
 Result QvrModule::camera_frame(std::uint64_t aligned_capture_time_ns,
                               const head::Bytes &tracking_pair, const head::Bytes &controller_pair,
                               std::int32_t frame_number, std::int32_t aux_frame_number)
@@ -245,14 +235,14 @@ Result QvrModule::camera_frame(std::uint64_t aligned_capture_time_ns,
     return invoke(fd_, handle_, call);
 }
 
-Result QvrModule::camera_frame_from_sof(std::uint64_t sof_boottime_ns, std::uint64_t effective_exposure_ns,
+Result QvrModule::camera_frame_from_qtimer_sof(std::uint64_t sof_qtimer_ticks, std::uint64_t effective_exposure_ns,
                                        const head::Bytes &tracking_pair, const head::Bytes &controller_pair,
                                        std::int32_t frame_number, std::int32_t aux_frame_number)
 {
-    camera::StockY8Time time;
-    if (!camera::stock_a081_y8_time(sof_boottime_ns, effective_exposure_ns, time))
+    camera::StockY8NativeTime time;
+    if (!camera::stock_a081_y8_native_time(sof_qtimer_ticks,effective_exposure_ns,time))
         return local_failure(EINVAL);
-    return camera_frame(time.submit_boottime_ns, tracking_pair, controller_pair, frame_number, aux_frame_number);
+    return camera_frame(time.submit_qtimer_ns,tracking_pair,controller_pair,frame_number,aux_frame_number);
 }
 
 Result QvrModule::qtimer_ticks(std::uint64_t &out)

@@ -42,8 +42,7 @@ static inline int a081_tracking_receive(int fd, struct a081_tracking_packet *out
 	if (n != sizeof(p) || p.magic != A081_TRACKING_MAGIC || p.version != A081_TRACKING_VERSION ||
 	    p.bytes != sizeof(p) || !p.session_id || !p.sequence ||
 	    (p.flags & ~A081_TRACKING_KNOWN_FLAGS) || !(p.flags & A081_TRACKING_IMU) ||
-	    !p.gyro_boottime_ns || !p.accel_boottime_ns || p.accel_boottime_ns > p.gyro_boottime_ns ||
-	    p.gyro_boottime_ns - p.accel_boottime_ns > A081_TRACKING_MAX_AGE_NS ||
+	    !p.gyro_boottime_ns || !p.accel_boottime_ns ||
 	    p.reserved[0] || p.reserved[1] || p.reserved[2] ||
 	    p.pose_read_status > A081_POSE_TIMESTAMP_MISMATCH) {
 		errno = EBADMSG; return -1;
@@ -52,7 +51,7 @@ static inline int a081_tracking_receive(int fd, struct a081_tracking_packet *out
 		if (!isfinite(p.gyro[i]) || !isfinite(p.accel[i])) { errno = EBADMSG; return -1; }
 	}
 	if ((p.flags & A081_TRACKING_CLOCK) && (!p.sample_monotonic_ns ||
-	    p.sample_monotonic_ns > p.send_monotonic_ns || p.clock_bracket_ns > A081_TRACKING_MAX_BRACKET_NS)) {
+	    p.sample_monotonic_ns > p.send_monotonic_ns)) {
 		errno = EBADMSG; return -1;
 	}
 	if ((p.flags & A081_TRACKING_RAW_POSE) && (p.pose_read_status != A081_POSE_COPIED ||

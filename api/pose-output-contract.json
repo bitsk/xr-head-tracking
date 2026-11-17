@@ -270,19 +270,13 @@
       "Return next_slot = current_slot+1, wrapping to0 at descriptor.count."
     ],
     "index_meaning": "The header is the most recently completed slot, not the next write slot and not a sample counter. For these rings its range is0..79.",
-    "paired_order": "The external combined-IMU consumer uses the same current slot for pose and DL. On successful onSensorData it publishes DL first, then pose, and advances the shared slot using the pose publisher return value. Their separate headers are not one atomic transaction.",
+    "paired_order": "Native onSensorData success publishes DL first, then pose, using same current slot; headers are not one atomic transaction.",
     "failure_behavior": "A failed tracker update does not execute the normal publish calls. It may already have changed/cleared the next slot. Its bytes must not be selected by scanning for arbitrary changed data.",
-    "ap_reader": "QVRServiceClientImpl::GetHeadTrackingData ELF0x10d48 loads the current index, checks0<=index<count, returns a pointer to slot index*192 and executes an ARM DMB. It does not copy a slot or validate a generation. The historical head/DL readers choose records by timestamp and also return pointers.",
+    "ap_reader": "Current original arm64 QVR client reads published index once, checks bounds, memcpy192 bytes into local history, and returns it; no timestamp/index reread, generation or shared lock.",
     "consistency_limit": "Equal header values before and after a copy are not a seqlock proof: after80 publications the index repeats, and a copy can overlap a producer write. A memory fence also does not replace DMA cache synchronization.",
-    "supported_capture": "For this reference, stop input producers, finish pending synchronous notifications, obtain successful stock stop, then use the existing DMA CPU-read synchronization to capture both rings before deinit/unmap. Decode immutable copies. This matches the parent bounded IMU experiment; it is not a new concurrently running reader protocol.",
+    "supported_capture": "Stopped immutable snapshots remain supported. Current native live reader uses DMA CPU sync, published index selection and up to3 consistency-copy attempts; this detects observed changes and preserves the original no-generation limitation.",
     "pair_diagnostics": "Compare pose/DL published_index and timestamp_ns in the quiescent snapshots. Equality supports pairing; it is not a pose-validity flag.",
-    "initialization": "An index outside0..79 is rejected. A zero-filled allocation has index0 and timestamp0; layout decoding can succeed without any output publication.",
-    "candidate_rpc_boundary_capture": {
-      "contract": "xr-desktop/system/tracking/live-stream-contract.json",
-      "device_verified": true,
-      "scope": "Only current external64B source; single QVR caller; native Android direct channels are not registered. Exact method10 direct call and publisher recovered in qvr_bridge.cpp and pose/imu contracts. Real acceptance:2596+2600 associated live records; final80 from each run match stopped ring bits. This does not establish arbitrary concurrent DSP writer safety.",
-      "consistency_limit": "Repeated index/copy equality is a diagnostic, not a seqlock or proof for arbitrary concurrent DSP writers. Timestamp equality is an association check, not tracking validity."
-    }
+    "initialization": "An index outside0..79 is rejected. A zero-filled allocation has index0 and timestamp0; layout decoding can succeed without any output publication."
   },
   "state_and_quality": {
     "mapping": [
@@ -332,13 +326,13 @@
       "Tracking-state/quality report vendor status. They do not independently establish a physically correct coordinate transform, translation scale, recentness, or camera-fed localization.",
       "The pure parser always exposes valid=false. It does not set any OpenXR location/velocity valid or tracked flags."
     ],
-    "necessary_quality_gate": "For any future positional-validity implementation, pose_quality==1.0 is a necessary vendor-quality gate, never sufficient by itself. pose_quality==0 must keep positional validity false even when tracking_state==4. The current parser deliberately keeps all validity false."
+    "necessary_quality_gate": "Original SDK position-tracked confidence uses gMinPoseQuality0.2. Lower quality does not reject available orientation or position data; state bits map confidence independently. Finite nonzero quaternion is normalized; state4 is a bitmask, not a required unique enum."
   },
   "coordinates_and_time": {
     "binary_confirmed": "Quaternion order xyzw; translation copy is unscaled in this QVR producer. The raw stock client returns this slot without a coordinate transform.",
     "sdk_reference": "QVRTypes.h documents Android Portrait coordinates. svrApiPredictiveSensor.cpp describes x up, y left, z towards the user and subsequently applies configured sensor orientation, negated translation in a matrix, and display-orientation-dependent transforms. Those later operations are not part of this raw decoder.",
     "remaining": "A081 physical/world handedness, head/IMU origin, translation scale under real movement, recenter policy and complete mapping to Monado/OpenXR remain unvalidated. Do not insert a guessed axis swap or quaternion conjugate into the decoder.",
-    "timestamp": "Both output records copy the input gyro timestamp. For the current external combined-ring path that is the supplied IIO CLOCK_BOOTTIME ns. A future native sensor/camera transport must establish its own QTimer/BOOTTIME relationship instead of applying the external-path conclusion globally.",
+    "timestamp": "Native Android104 sensor timestamp is QTimer ns in qc_vr_mode1; the DSP stores the source gyro timestamp unchanged at pose+32 and DL+104. AP associates that exact native epoch with a real source event and measured clock tuple before emitting BOOTTIME/MONOTONIC wire times.",
     "prediction": "The angular/translation coefficient offsets are established, but this task does not integrate a prediction algorithm. DL group semantics remain unresolved."
   },
   "parser_api": {

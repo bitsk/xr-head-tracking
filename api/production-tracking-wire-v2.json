@@ -2,8 +2,8 @@
   "schema_version": 1,
   "interface": "a081-tracking-wire",
   "interface_version": 2,
-  "owner": "qiyu-head-tracking",
-  "status": "Record of the existing production transport; does not promote or rebuild the frozen producer sources in this repository.",
+  "owner": "xr-head-tracking",
+  "status": "Current240-byte production transport from original native SEE/QDI/HRP output.",
   "transport": {
     "address_family": "AF_UNIX",
     "socket_type": "SOCK_SEQPACKET",
@@ -13,111 +13,311 @@
     "packet_bytes": 240,
     "message_framing": "Exactly one complete 240-byte packet per message; reject truncation, oversized records and a version/bytes mismatch.",
     "magic_hex": "0x54523841",
-    "known_flags_hex": "0x0000000f",
-    "maximum_imu_age_ns": 100000000,
-    "maximum_clock_bracket_ns": 50000
+    "known_flags_hex": "0x0000000f"
   },
   "source_artifacts": [
     {
-      "role": "Production v2 wire declaration",
-      "scope": "Legacy integration source outside this repository",
-      "path": "xr-desktop/system/tracking/a081_tracking_wire.h",
-      "sha256": "aed2c177a86ef4f5eeb28b40c45acaf14ff75910f3bc0191c82cbb8339289e2c"
+      "role": "Wire declaration",
+      "path": "include/xr/head/production-v2/a081_tracking_wire.h"
     },
     {
-      "role": "Existing transport-client checks",
-      "scope": "Legacy integration source outside this repository",
-      "path": "xr-desktop/system/tracking/a081_tracking_client.h",
-      "sha256": "83356b9167f8a6ba7dcefe7a34a9404c38159ce71e46e6739147670fdfdbec8e"
+      "role": "Transport checks",
+      "path": "include/xr/head/production-v2/a081_tracking_client.h"
     },
     {
-      "role": "Coherent pose-record copy and OEM coefficient publication",
-      "scope": "Legacy integration source outside this repository",
-      "path": "xr-desktop/system/tracking/head/imu-live.hpp",
-      "sha256": "ece6290b896b52bebf6062a33c8f5270a809736d933e48456e03836974fc77d3"
+      "role": "Native source association and publication",
+      "path": "src/imu-live.hpp"
     },
     {
-      "role": "192-byte raw pose-record decoder",
-      "scope": "Legacy integration source outside this repository",
-      "path": "xr-desktop/system/tracking/head/a081_pose_output.hpp",
-      "sha256": "8866101a49a84630f88b1188276d1877628524e9449d1485fcb9a4066e1c34cf"
+      "role": "OEM192-byte slot decoder",
+      "path": "src/a081_pose_output.hpp"
     }
   ],
   "fields": [
-    {"name": "magic", "offset": 0, "bytes": 4, "type": "u32", "constant_hex": "0x54523841"},
-    {"name": "version", "offset": 4, "bytes": 4, "type": "u32", "constant": 2},
-    {"name": "bytes", "offset": 8, "bytes": 4, "type": "u32", "constant": 240},
-    {"name": "flags", "offset": 12, "bytes": 4, "type": "u32", "meaning": "Transport/source-presence flags; never OpenXR relation flags."},
-    {"name": "session_id", "offset": 16, "bytes": 8, "type": "u64", "meaning": "Nonzero producer-session identity."},
-    {"name": "sequence", "offset": 24, "bytes": 8, "type": "u64", "meaning": "Nonzero producer publication sequence."},
-    {"name": "gyro_boottime_ns", "offset": 32, "bytes": 8, "type": "u64", "clock": "CLOCK_BOOTTIME", "unit": "ns"},
-    {"name": "accel_boottime_ns", "offset": 40, "bytes": 8, "type": "u64", "clock": "CLOCK_BOOTTIME", "unit": "ns"},
-    {"name": "sample_monotonic_ns", "offset": 48, "bytes": 8, "type": "u64", "clock": "CLOCK_MONOTONIC", "unit": "ns", "meaning": "Bounded conversion of the gyro sample timestamp when CLOCK is present."},
-    {"name": "send_monotonic_ns", "offset": 56, "bytes": 8, "type": "u64", "clock": "CLOCK_MONOTONIC", "unit": "ns"},
-    {"name": "pose_boottime_ns", "offset": 64, "bytes": 8, "type": "u64", "clock": "CLOCK_BOOTTIME", "unit": "ns"},
-    {"name": "last_camera_boottime_ns", "offset": 72, "bytes": 8, "type": "u64", "clock": "CLOCK_BOOTTIME", "unit": "ns"},
-    {"name": "gyro", "offset": 80, "bytes": 12, "type": "f32[3]", "unit": "rad/s", "meaning": "Real external-SDK-axis input, copied without a runtime-coordinate conversion."},
-    {"name": "accel", "offset": 92, "bytes": 12, "type": "f32[3]", "unit": "m/s^2", "meaning": "Real external-SDK-axis input, copied without a runtime-coordinate conversion."},
-    {"name": "rotation_xyzw", "offset": 104, "bytes": 16, "type": "f32[4]", "meaning": "Raw vendor quaternion in x,y,z,w order; runtime mapping is separate."},
-    {"name": "translation", "offset": 120, "bytes": 12, "type": "f32[3]", "meaning": "Raw vendor translation; presence is not physical position acceptance."},
-    {"name": "pose_quality", "offset": 132, "bytes": 4, "type": "f32", "meaning": "Raw vendor quality, not an Xr validity bit."},
-    {"name": "tracking_state", "offset": 136, "bytes": 4, "type": "u32", "meaning": "Raw vendor tracking state, widened from the source record u16."},
-    {"name": "warning_flags", "offset": 140, "bytes": 4, "type": "u32", "meaning": "Raw vendor warning bits, widened from the source record u16."},
-    {"name": "pose_index", "offset": 144, "bytes": 4, "type": "u32", "meaning": "Published pose-ring index; must be below 80 when RAW_POSE is present."},
-    {"name": "clock_bracket_ns", "offset": 148, "bytes": 4, "type": "u32", "unit": "ns"},
-    {"name": "pose_read_status", "offset": 152, "bytes": 4, "type": "u32", "enum": "a081_pose_read_status"},
-    {"name": "reserved", "offset": 156, "bytes": 12, "type": "u32[3]", "meaning": "All three elements must be zero."},
-    {"name": "angular_s", "offset": 168, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 48},
-    {"name": "angular_b", "offset": 180, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 64},
-    {"name": "angular_bdt", "offset": 192, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 80},
-    {"name": "angular_bdt2", "offset": 204, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 96},
-    {"name": "translation_s", "offset": 216, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 128},
-    {"name": "translation_b", "offset": 228, "bytes": 12, "type": "f32[3]", "source_pose_record_offset": 144}
+    {
+      "name": "magic",
+      "offset": 0,
+      "bytes": 4,
+      "type": "u32",
+      "constant_hex": "0x54523841"
+    },
+    {
+      "name": "version",
+      "offset": 4,
+      "bytes": 4,
+      "type": "u32",
+      "constant": 2
+    },
+    {
+      "name": "bytes",
+      "offset": 8,
+      "bytes": 4,
+      "type": "u32",
+      "constant": 240
+    },
+    {
+      "name": "flags",
+      "offset": 12,
+      "bytes": 4,
+      "type": "u32",
+      "meaning": "Transport/source-presence flags; never OpenXR relation flags."
+    },
+    {
+      "name": "session_id",
+      "offset": 16,
+      "bytes": 8,
+      "type": "u64",
+      "meaning": "Nonzero producer-session identity."
+    },
+    {
+      "name": "sequence",
+      "offset": 24,
+      "bytes": 8,
+      "type": "u64",
+      "meaning": "Nonzero producer publication sequence."
+    },
+    {
+      "name": "gyro_boottime_ns",
+      "offset": 32,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_BOOTTIME",
+      "unit": "ns"
+    },
+    {
+      "name": "accel_boottime_ns",
+      "offset": 40,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_BOOTTIME",
+      "unit": "ns"
+    },
+    {
+      "name": "sample_monotonic_ns",
+      "offset": 48,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_MONOTONIC",
+      "unit": "ns",
+      "meaning": "Measured representable conversion of the actual gyro epoch; causal sample<=send required when CLOCK is present."
+    },
+    {
+      "name": "send_monotonic_ns",
+      "offset": 56,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_MONOTONIC",
+      "unit": "ns"
+    },
+    {
+      "name": "pose_boottime_ns",
+      "offset": 64,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_BOOTTIME",
+      "unit": "ns"
+    },
+    {
+      "name": "last_camera_boottime_ns",
+      "offset": 72,
+      "bytes": 8,
+      "type": "u64",
+      "clock": "CLOCK_BOOTTIME",
+      "unit": "ns"
+    },
+    {
+      "name": "gyro",
+      "offset": 80,
+      "bytes": 12,
+      "type": "f32[3]",
+      "unit": "rad/s",
+      "meaning": "Real native Android-portrait input; no runtime-coordinate conversion or repeated bias subtraction."
+    },
+    {
+      "name": "accel",
+      "offset": 92,
+      "bytes": 12,
+      "type": "f32[3]",
+      "unit": "m/s^2",
+      "meaning": "Real native Android-portrait input; no runtime-coordinate conversion or repeated bias subtraction."
+    },
+    {
+      "name": "rotation_xyzw",
+      "offset": 104,
+      "bytes": 16,
+      "type": "f32[4]",
+      "meaning": "Raw vendor quaternion in x,y,z,w order; runtime mapping is separate."
+    },
+    {
+      "name": "translation",
+      "offset": 120,
+      "bytes": 12,
+      "type": "f32[3]",
+      "meaning": "Raw vendor translation; presence is not physical position acceptance."
+    },
+    {
+      "name": "pose_quality",
+      "offset": 132,
+      "bytes": 4,
+      "type": "f32",
+      "meaning": "Raw vendor quality, not an Xr validity bit."
+    },
+    {
+      "name": "tracking_state",
+      "offset": 136,
+      "bytes": 4,
+      "type": "u32",
+      "meaning": "Raw vendor tracking state, widened from the source record u16."
+    },
+    {
+      "name": "warning_flags",
+      "offset": 140,
+      "bytes": 4,
+      "type": "u32",
+      "meaning": "Raw vendor warning bits, widened from the source record u16."
+    },
+    {
+      "name": "pose_index",
+      "offset": 144,
+      "bytes": 4,
+      "type": "u32",
+      "meaning": "Published pose-ring index; must be below 80 when RAW_POSE is present."
+    },
+    {
+      "name": "clock_bracket_ns",
+      "offset": 148,
+      "bytes": 4,
+      "type": "u32",
+      "unit": "ns"
+    },
+    {
+      "name": "pose_read_status",
+      "offset": 152,
+      "bytes": 4,
+      "type": "u32",
+      "enum": "a081_pose_read_status"
+    },
+    {
+      "name": "reserved",
+      "offset": 156,
+      "bytes": 12,
+      "type": "u32[3]",
+      "meaning": "All three elements must be zero."
+    },
+    {
+      "name": "angular_s",
+      "offset": 168,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 48
+    },
+    {
+      "name": "angular_b",
+      "offset": 180,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 64
+    },
+    {
+      "name": "angular_bdt",
+      "offset": 192,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 80
+    },
+    {
+      "name": "angular_bdt2",
+      "offset": 204,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 96
+    },
+    {
+      "name": "translation_s",
+      "offset": 216,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 128
+    },
+    {
+      "name": "translation_b",
+      "offset": 228,
+      "bytes": 12,
+      "type": "f32[3]",
+      "source_pose_record_offset": 144
+    }
   ],
   "known_flags": [
-    {"name": "A081_TRACKING_IMU", "value": 1, "meaning": "Real IMU input is present; required by the existing transport client."},
-    {"name": "A081_TRACKING_CLOCK", "value": 2, "meaning": "The producer obtained a bounded BOOTTIME-to-MONOTONIC sample conversion."},
-    {"name": "A081_TRACKING_RAW_POSE", "value": 4, "meaning": "A coherent raw vendor pose record with matching gyro timestamp was copied; not proof of valid tracking quality."},
-    {"name": "A081_TRACKING_CAMERA_SUBMITTED", "value": 8, "meaning": "The producer recorded a camera submission; consumers must independently check freshness and pose validity."}
+    {
+      "name": "A081_TRACKING_IMU",
+      "value": 1,
+      "meaning": "Real IMU input is present; required by the existing transport client."
+    },
+    {
+      "name": "A081_TRACKING_CLOCK",
+      "value": 2,
+      "meaning": "A representable, causal measured BOOTTIME-to-MONOTONIC conversion is present; bracket is telemetry, not a50us gate."
+    },
+    {
+      "name": "A081_TRACKING_RAW_POSE",
+      "value": 4,
+      "meaning": "A published native OEM192-byte slot passed finite copy checks and exact real gyro-epoch association. This is not pose-quality or physical tracking validation."
+    },
+    {
+      "name": "A081_TRACKING_CAMERA_SUBMITTED",
+      "value": 8,
+      "meaning": "The producer recorded a camera submission; consumers must independently check freshness and pose validity."
+    }
   ],
   "pose_read_status": [
-    {"name": "A081_POSE_NOT_READ", "value": 0},
-    {"name": "A081_POSE_COPIED", "value": 1},
-    {"name": "A081_POSE_BAD_INDEX", "value": 2},
-    {"name": "A081_POSE_CHANGED_DURING_COPY", "value": 3},
-    {"name": "A081_POSE_TIMESTAMP_MISMATCH", "value": 4}
+    {
+      "name": "A081_POSE_NOT_READ",
+      "value": 0
+    },
+    {
+      "name": "A081_POSE_COPIED",
+      "value": 1
+    },
+    {
+      "name": "A081_POSE_BAD_INDEX",
+      "value": 2
+    },
+    {
+      "name": "A081_POSE_CHANGED_DURING_COPY",
+      "value": 3
+    },
+    {
+      "name": "A081_POSE_TIMESTAMP_MISMATCH",
+      "value": 4
+    }
   ],
   "oem_prediction_tail": {
     "offset": 168,
     "bytes": 72,
     "float_count": 18,
     "source_pose_record_bytes": 192,
-    "field_order": ["angular_s", "angular_b", "angular_bdt", "angular_bdt2", "translation_s", "translation_b"],
-    "coherence": "All six vectors are copied from the same 192-byte record as quaternion, translation, timestamp, quality and state. The producer compares the published index before/after and compares two record copies before setting RAW_POSE.",
-    "semantics": "Raw OEM prediction coefficients, preserved verbatim in wire order. Interpretation and prediction timing belong to the explicit runtime consumer; this contract adds no prediction or coordinate transform.",
-    "forbidden_substitution": "Do not extend a v1 packet with invented, extrapolated or zero-filled coefficients and advertise it as a real v2 producer packet."
+    "field_order": [
+      "angular_s",
+      "angular_b",
+      "angular_bdt",
+      "angular_bdt2",
+      "translation_s",
+      "translation_b"
+    ],
+    "coherence": "All vectors come from the same selected published192-byte record as pose/time/state. DMA synchronization and copy checks detect observed interference. Original ring has no generation or formal atomic snapshot guarantee.",
+    "semantics": "Raw OEM prediction coefficients, preserved verbatim in wire order. Interpretation and prediction timing belong to the explicit runtime consumer; this contract adds no prediction or coordinate transform."
   },
   "existing_transport_client_checks": [
-    "Receive with MSG_TRUNC and require exactly 240 bytes, matching magic, version=2 and bytes=240.",
-    "Require nonzero session_id and sequence; reject any flags outside 0x0f; require IMU.",
-    "Require nonzero gyro/accel BOOTTIME timestamps, accel <= gyro and gyro-accel <= 100000000 ns.",
-    "Require finite gyro and accel vectors, all reserved words zero and pose_read_status <= 4.",
-    "If CLOCK is set, require nonzero sample_monotonic_ns <= send_monotonic_ns and clock_bracket_ns <= 50000.",
-    "If RAW_POSE is set, require pose_read_status=1, pose_index < 80 and pose_boottime_ns=gyro_boottime_ns.",
-    "These transport checks do not replace downstream packet-age, raw-quality, quaternion, camera-age, prediction-coefficient or coordinate/physical validity gates."
+    "Require exactly240 bytes and current magic/version/bytes.",
+    "Require nonzero session_id, sequence, gyro and accel source epochs, known flags and real IMU presence.",
+    "Require finite real IMU vectors, zero reserved words and defined read status.",
+    "CLOCK requires nonzero sample_monotonic_ns<=send_monotonic_ns; clock bracket is measured telemetry.",
+    "RAW_POSE requires copied status, index<80 and pose epoch equal to real gyro epoch.",
+    "No fixed sample-age, accel-order, camera-age, bracket, quaternion-norm or whole-coefficient gate is part of transport integrity. Runtime maps each OEM field independently."
   ],
-  "compatibility_boundary": {
-    "frozen_header": "include/xr/head/a081_tracking_wire.h",
-    "frozen_header_sha256": "a59d94185675de3196f63ac0d682cb6f26a0d283e2615ddda3cab5671bc36062",
-    "frozen_header_version": 1,
-    "frozen_header_packet_bytes": 168,
-    "common_prefix_bytes": 168,
-    "wire_compatible": false,
-    "rule": "The common field prefix does not make the versioned protocols interchangeable. Current v2 clients must consume the existing v2 source contract; rebuilding old producer sources against their unchanged v1 header does not produce v2.",
-    "producer_or_driver_rebuilt_by_this_change": false,
-    "producer_or_driver_deployed_by_this_change": false,
-    "existing_c_cpp_or_headers_modified": false,
-    "device_access_performed_for_this_record": false,
-    "new_tracking_or_physical_acceptance_claimed": false
+  "validation": {
+    "offline_source_implemented": true,
+    "native_target_deployed": false,
+    "physical_tracking_accepted": false
   }
 }

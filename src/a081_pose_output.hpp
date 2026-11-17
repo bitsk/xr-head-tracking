@@ -43,8 +43,8 @@ struct PoseSnapshot {
     std::uint32_t published_index{};
     std::array<float, 4> rotation_xyzw{};
     std::array<float, 3> translation{};
-    // Producer sensor timestamp. External-IMU mode preserves supplied gyro
-    // BOOTTIME ns; other transports may use a different source time domain.
+    // Original native producer copies the gyro QTimer-nanosecond epoch.
+    // Clock conversion belongs to exact real source-event association.
     std::uint64_t timestamp_ns{};
     std::array<float, 3> angular_s{};
     std::array<float, 3> angular_b{};

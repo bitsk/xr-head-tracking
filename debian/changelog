@@ -1,3 +1,13 @@
+xr-head-tracking (0.1.14) unstable; urgency=medium
+
+  * Consume original native shared gyro/accel rings and asynchronous QDI/HRP output.
+  * Remove external combined input, method10, AP gyro integration and duplicate headers.
+  * Associate published OEM epochs with real input metadata and raw QCFT camera time.
+  * Remove unsupported camera, age, bracket, quaternion-norm and whole-coefficient gates.
+  * Normalize finite nonzero orientation; map state confidence by bits and retain OEM position quality0.2.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 00:44:11 +0800
+
 xr-head-tracking (0.1.13) unstable; urgency=medium
 
   * Preserve coherent OEM orientation when only position quality falls.

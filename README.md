@@ -2,14 +2,19 @@
 
 QVR/CDSP 头部跟踪与姿态接口。
 
-正常输入仅消费 xr-device-io 的原厂 800 Hz direct 流。
-`XR_SEE_IMU_SOCKET` 指向会话管理器启动的唯一 SDSP 生产者；
-`A081_QVR_IMU_HISTORY` 提供独立于相机 RPC 的实时陀螺共享历史。
-不再打开 IIO 或选择另一采样档位。回撤实现通过 Git 提交重建。
-原厂 Android 未校准事件的三轴值和采样时刻显式转换成现有 external64
-输入；保留每台设备原有相机/IMU 标定和 DSP 算法，不重复扣除 bias。
-生产者消失、格式/时钟不符或顺序错误会终止输入，不静默切换数据源。
+输入消费 xr-device-io 唯一的原厂800Hz请求路径。`XR_SEE_IMU_SOCKET` 使用
+XSL4 握手，以 SCM_RIGHTS 交接同一对4096字节真实 DMA 缓冲区，分别注册
+CDSP 的原厂 gyro ring0 和 accel ring5。原厂 `adsp_imu`/QDI 线程自主推进 HRP；
+相机 RPC 调用者只提交相机，AP 不重写104字节输入、不喂逐样本 RPC，也不积分原始陀螺。
 
+独立读取线程持续消费真实采样元数据，按已发布 OEM 槽与精确 QTimer 纳秒 epoch
+配对后发布240字节头姿接口。原厂 VR 模式跳过传感器 timestamp_offset；AP 用
+实测时钟元组换算输出时刻，相机直接使用 QCFT 原始 QTimer SOF，按相同625/12换算和原厂曝光数学对齐，避免 BOOTTIME 往返。
+未就绪或未配对不生成姿态。有限 DMA 同步/一致性读取保留原厂环没有 generation
+的边界；双份数据一致不代表序列锁。原厂标定、质量与状态保留，不添加运动阈值。
+
+该原生共享缓冲实现已完成离线源码准备，跨 DSP 导入、QDI 自主唤醒、相机 RPC
+期间 HRP 的持续推进和佩戴效果仍须目标设备验证。历史实现由 Git 保留。
 
 构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://github.com/bitsk/openkylin-xr-docs)。
 

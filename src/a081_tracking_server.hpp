@@ -63,8 +63,7 @@ public:
             packet.send_monotonic_ns = after;
             packet.clock_bracket_ns = after >= before && after - before <= UINT32_MAX ?
                                       static_cast<std::uint32_t>(after - before) : UINT32_MAX;
-            if (before && boot && after >= before && packet.clock_bracket_ns <= A081_TRACKING_MAX_BRACKET_NS &&
-                boot >= packet.gyro_boottime_ns && boot - packet.gyro_boottime_ns <= A081_TRACKING_MAX_AGE_NS) {
+            if (before && boot && after >= before && after-before<=UINT32_MAX && boot>=packet.gyro_boottime_ns) {
                 const auto mono = before + (after - before) / 2;
                 const auto age = boot - packet.gyro_boottime_ns;
                 if (mono > age) {
@@ -75,7 +74,7 @@ public:
             }
         }
         if (!(packet.flags & A081_TRACKING_CLOCK)) ++clock_invalid_;
-        // Bounded accept/send work on the only QVR caller thread. A slow client
+        // Bounded accept/send work on the independent publication thread. A slow client
         // is disconnected; it must reconnect instead of reading stale backlog.
         for (unsigned i = 0; i < peers_.size(); ++i) {
             const int peer = accept4(fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);

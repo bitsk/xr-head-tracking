@@ -7,7 +7,39 @@
 class DirectImuInput {
 public:
     ~DirectImuInput() { close(); }
-    void close() { if(fd_>=0) { ::close(fd_);fd_=-1; } }
+    void close() {
+        if(fd_>=0) { ::close(fd_);fd_=-1; }
+        for(auto &fd:buffers_) if(fd>=0) { ::close(fd);fd=-1; }
+    }
+    int take_buffer(unsigned kind) {
+        if(kind>=buffers_.size()) return -1;
+        const int fd=buffers_[kind];buffers_[kind]=-1;return fd;
+    }
+    bool start() {
+        return fd_>=0 && xr::see::send_control(fd_,xr::see::Command::start)==0;
+    }
+    bool stop() {
+        if(fd_<0) return true;
+        if(xr::see::send_control(fd_,xr::see::Command::stop)) return false;
+        // Same bounded shutdown budget as the owning session supervisor.
+        const auto deadline=boottime_ns()+8000000000ULL;
+        while(boottime_ns()<deadline) {
+            pollfd descriptor{fd_,POLLIN,0};
+            const int ready=poll(&descriptor,1,100);
+            if(ready<0 && errno==EINTR) continue;
+            if(ready<0 || ((descriptor.revents&(POLLERR|POLLHUP|POLLNVAL)) && !(descriptor.revents&POLLIN))) return false;
+            if(!ready) continue;
+            xr::see::Packet packet{};
+            const auto n=recv(fd_,&packet,sizeof(packet),MSG_TRUNC);
+            if(n==sizeof(packet)) continue; // Drain real events queued before Stop.
+            if(n!=sizeof(xr::see::Control)) return false;
+            xr::see::Control control{};std::memcpy(static_cast<void *>(&control),static_cast<const void *>(&packet),sizeof(control));
+            return control.magic==xr::see::packet_magic && control.command==xr::see::Command::stopped &&
+                control.allocation_bytes==xr::see::allocation_bytes && control.event_bytes==xr::see::event_bytes &&
+                control.channels==2 && control.period_us==period_ && control.flags==2 && !control.reserved;
+        }
+        return false;
+    }
     bool connect()
     {
         const char *path=std::getenv("XR_SEE_IMU_SOCKET");
@@ -18,14 +50,20 @@ public:
         if(fd_<0 || ::connect(fd_,reinterpret_cast<sockaddr *>(&address),sizeof(address))) return false;
         ucred peer{};socklen_t length=sizeof(peer);
         if(getsockopt(fd_,SOL_SOCKET,SO_PEERCRED,&peer,&length) || peer.uid!=geteuid()) return false;
-        report("see_input",{},"source=direct period_us="+std::to_string(period_)+
-            " notification=sns_llcm_poll wire=XSL3 raw_clock=qtimer_ns sample_clock=boottime_ns");
+        xr::see::Control control{};
+        if(xr::see::receive_control(fd_,control,buffers_) || control.command!=xr::see::Command::buffers) return false;
+        for(int fd:buffers_) {
+            struct stat info{};
+            if(fd<0 || fstat(fd,&info) || info.st_size!=xr::see::allocation_bytes) return false;
+        }
+        report("see_input",{},"source=native_shared_dma period_us="+std::to_string(period_)+
+            " notification=original_QDI wire=XSL4 event_clock=qtimer_ns metadata_clock=boottime_ns");
         return true;
     }
     int fd() const { return fd_; }
     bool read_batch(std::vector<Sample> &batch,const std::array<int,3> &axes)
     {
-        for(unsigned i=0;i<128;++i) {
+        for(unsigned i=0;i<2*xr::see::native_capacity;++i) {
             xr::see::Packet packet{};
             const auto n=recv(fd_,&packet,sizeof(packet),MSG_DONTWAIT|MSG_TRUNC);
             if(n<0 && (errno==EAGAIN || errno==EINTR)) return true;
@@ -38,7 +76,7 @@ public:
             if(!xr::see::decode(packet,kind==1,time,xyz) || time<=last_[kind] ||
                 xr::see::get64(packet.event,16)<=last_raw_[kind] ||
                 packet.clock_anchor_qtimer_ns<last_anchor_[kind] ||
-                (time>arrival && time-arrival>xr::see::qtimer_tick_ns) || arrival>time+1000000000 ||
+                (time>arrival && time-arrival>xr::see::qtimer_tick_ns) ||
                 packet.arrival_boottime_ns>arrival) {
                 report("see_input",failure(EPROTO),"invalid sample clock/order/value");return false;
             }
@@ -60,7 +98,7 @@ public:
             counter_[kind]=counter;last_[kind]=time;++samples_[kind];
             last_raw_[kind]=xr::see::get64(packet.event,16);
             last_anchor_[kind]=packet.clock_anchor_qtimer_ns;
-            Sample sample{time,{},kind==1};
+            Sample sample{time,{},kind==1,packet};
             for(unsigned axis=0;axis<3;++axis)
                 sample.value[axis]=xyz[std::abs(axes[axis])-1]*(axes[axis]<0 ? -1.0f : 1.0f);
             batch.push_back(sample);
@@ -81,7 +119,7 @@ public:
         }
     }
 private:
-    int fd_=-1;static constexpr unsigned period_=1250;
+    int fd_=-1;std::array<int,2> buffers_{{-1,-1}};static constexpr unsigned period_=1250;
     std::uint64_t first_[2]{},last_[2]{},samples_[2]{},gaps_[2]{};
     std::uint64_t max_interval_[2]{},max_age_[2]{},max_delivery_[2]{};
     std::uint32_t counter_[2]{};

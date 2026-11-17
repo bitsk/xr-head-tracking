@@ -36,7 +36,7 @@ int main(int argc, char **argv)
 	sigemptyset(&sa.sa_mask); sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
 	uint64_t deadline = now_ns() + (uint64_t)seconds * UINT64_C(1000000000);
 	uint64_t packets = 0, raw_pose = 0, quality_zero = 0, quality_one = 0;
-	uint64_t missing_pose = 0, invalid_clock = 0, stale = 0, gaps = 0;
+	uint64_t missing_pose = 0, invalid_clock = 0, noncausal_clock = 0, gaps = 0;
 	uint64_t session = 0, sequence = 0, last_gyro = 0, first_gyro = 0;
 	int fd = -1, failed = 0;
 	uint64_t segment_bytes = 0;
@@ -88,7 +88,7 @@ int main(int argc, char **argv)
         ++packets;
 		uint64_t now = now_ns();
 		if (!(packet.flags & A081_TRACKING_CLOCK)) ++invalid_clock;
-		else if (packet.sample_monotonic_ns > now || now - packet.sample_monotonic_ns >= A081_TRACKING_MAX_AGE_NS) ++stale;
+		else if (packet.sample_monotonic_ns > now) ++noncausal_clock;
 		if (packet.flags & A081_TRACKING_RAW_POSE) {
 			++raw_pose;
 			quality_zero += packet.pose_quality == 0.0f;
@@ -99,10 +99,10 @@ int main(int argc, char **argv)
 	if (output >= 0 && close(output) != 0) failed = 1;
 	printf("{\"packets\":%" PRIu64 ",\"raw_pose\":%" PRIu64 ",\"quality_zero\":%" PRIu64
 	       ",\"quality_one\":%" PRIu64 ",\"missing_pose\":%" PRIu64 ",\"invalid_clock\":%" PRIu64
-	       ",\"stale\":%" PRIu64 ",\"sequence_gaps\":%" PRIu64 ",\"session_id\":%" PRIu64
+	       ",\"noncausal_clock\":%" PRIu64 ",\"sequence_gaps\":%" PRIu64 ",\"session_id\":%" PRIu64
 	       ",\"first_gyro_boottime_ns\":%" PRIu64 ",\"last_gyro_boottime_ns\":%" PRIu64
 	       ",\"interrupted\":%s,\"error\":%s,\"openxr_position_valid\":false}\n",
-	       packets, raw_pose, quality_zero, quality_one, missing_pose, invalid_clock, stale, gaps,
+	       packets, raw_pose, quality_zero, quality_one, missing_pose, invalid_clock, noncausal_clock, gaps,
 	       session, first_gyro, last_gyro, interrupted ? "true" : "false", failed ? "true" : "false");
 	return failed || !packets ? 1 : 0;
 }

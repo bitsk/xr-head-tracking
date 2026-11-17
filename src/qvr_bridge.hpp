@@ -53,26 +53,22 @@ public:
     // until stop and deinit succeed. No camera/sensor input is synthesized.
     Result start(std::string_view config6, std::string_view calibration, float sensor_frequency_hz = 800.0f);
     Result stop();
-    // Publish the complete combined 64-byte ring0 record and its index before
-    // this synchronous call. It consumes the current slot, not a queue. RPC
-    // success does not establish that the tracker emitted a valid pose.
-    Result external_sensor_ready();
     // Exact A081 inline-Y8 path from camera-input-contract.json. Each buffer
     // is 480 rows of 640 left + 640 right bytes (1280-byte stride). Primary is
     // trackingA/B, auxiliary is ctrl-trackingA/B. Caller must establish their
     // real physical identity, exposure pairing and a common timestamp domain
-    // before calling. Our external-IMU path requires BOOTTIME for the camera
-    // too; the stock native-sensor branch uses QTimer instead. Never mix them.
+    // before calling. Native camera and IMU input both use QTimer nanoseconds.
+    // The QCFT caller uses its frame-associated raw QTimer SOF directly.
     // EOF/receipt time is insufficient; this method performs no conversion.
     // The QCFT caller requires the physical gate, fixed controls and verified
     // metadata association. RPC success alone does not establish valid 6DoF.
     Result camera_frame(std::uint64_t aligned_capture_time_ns,
                         const head::Bytes &tracking_pair, const head::Bytes &controller_pair,
                         std::int32_t frame_number, std::int32_t aux_frame_number);
-    // Same import using the recovered A081 CamX/Y8 timing convention. Inputs
-    // require a frame-associated SOF in BOOTTIME and effective exposure; EOF
-    // or event notification time cannot be used. See a081_camera_timing.hpp.
-    Result camera_frame_from_sof(std::uint64_t sof_boottime_ns, std::uint64_t effective_exposure_ns,
+    // Same import using recovered CamX/Y8 exposure arithmetic directly on
+    // frame-associated19.2MHz QTimer SOF. No BOOTTIME offset round trip.
+    // Effective exposure must belong to this frame; EOF/receipt is not SOF.
+    Result camera_frame_from_qtimer_sof(std::uint64_t sof_qtimer_ticks, std::uint64_t effective_exposure_ns,
                                  const head::Bytes &tracking_pair, const head::Bytes &controller_pair,
                                  std::int32_t frame_number, std::int32_t aux_frame_number);
     // qurt_sysclock_get_hw_ticks(), not nanoseconds or CLOCK_MONOTONIC.
