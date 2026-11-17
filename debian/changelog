@@ -1,3 +1,10 @@
+xr-head-tracking (0.1.13) unstable; urgency=medium
+
+  * Preserve coherent OEM orientation when only position quality falls.
+  * Map the MIX stock position-quality setting to the position-tracked bit.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 20:17:09 +0800
+
 xr-head-tracking (0.1.12) unstable; urgency=medium
 
   * Consume XSL3 dynamic clock mappings without a fixed session offset.

@@ -18,7 +18,8 @@ a081_qvr_pose(const struct a081_tracking_packet *p, uint64_t now, struct xrt_spa
 	memset(out, 0, sizeof(*out));
 	out->pose.orientation.w = 1.0f;
 	if (p->flags != A081_TRACKING_KNOWN_FLAGS || p->pose_read_status != A081_POSE_COPIED ||
-	    p->pose_quality != 1.0f || p->tracking_state != 4 || p->pose_index >= 80 ||
+	    !isfinite(p->pose_quality) || p->pose_quality < 0.0f || p->pose_quality > 1.0f ||
+	    p->tracking_state != 4 || p->pose_index >= 80 ||
 	    p->pose_boottime_ns != p->gyro_boottime_ns || !p->last_camera_boottime_ns ||
 	    p->last_camera_boottime_ns > p->gyro_boottime_ns ||
 	    p->gyro_boottime_ns - p->last_camera_boottime_ns >= A081_TRACKING_MAX_AGE_NS ||
@@ -48,8 +49,13 @@ a081_qvr_pose(const struct a081_tracking_packet *p, uint64_t now, struct xrt_spa
 	// Monado requires world velocity; its OpenVR adapter converts it back.
 	const struct xrt_vec3 body = {-p->angular_s[1], p->angular_s[0], p->angular_s[2]};
 	math_quat_rotate_vec3(&out->pose.orientation, &body, &out->angular_velocity);
+	// SXR L_CheckPoseQuality only removes kTrackingPosition when quality is
+	// low. A coherent OEM rotation is still used by L_TrackingToReturn;
+	// replacing it with a separate IMU filter changes the estimator mid-turn.
+	// MIX's shipped svrapi_config.txt sets gMinPoseQuality = 0.2.
 	out->relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-	                      XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+	                      XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	                      XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+	if (p->pose_quality >= 0.2f) out->relation_flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 	return true;
 }
