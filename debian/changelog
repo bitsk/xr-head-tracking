@@ -1,3 +1,10 @@
+xr-head-tracking (0.1.17) unstable; urgency=medium
+
+  * Validate the copied native record independently of publication into other
+    slots, avoiding false pose/history unavailability under continuous HRP.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 23:07:58 +0800
+
 xr-head-tracking (0.1.16) unstable; urgency=medium
 
   * Report raw pose field availability and OEM confidence separately in the

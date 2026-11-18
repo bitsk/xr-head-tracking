@@ -363,10 +363,11 @@ public:
                 for(std::size_t i=0;i<confirm.size();++i) confirm[i]=slot[i];
             }
             std::atomic_thread_fence(std::memory_order_acquire);
-            const auto last=__atomic_load_n(index,__ATOMIC_ACQUIRE);
             if(!sync(DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ)) return false;
             if(first>=spec_.count) { status=A081_POSE_BAD_INDEX;return true; }
-            if(first!=last || copy!=confirm) continue;
+            // Publishing another slot does not invalidate this completed
+            // record. Only interference with the selected record matters.
+            if(copy!=confirm) continue;
             pose_output::PoseSnapshot pose{};
             if(pose_output::decode_pose_record(copy.data(),copy.size(),first,pose)!=pose_output::DecodeStatus::ok)
                 return false;
@@ -401,9 +402,10 @@ public:
                 for(std::size_t i=0;i<confirm.size();++i) confirm[i]=record[i];
             }
             std::atomic_thread_fence(std::memory_order_acquire);
-            const auto last=__atomic_load_n(index,__ATOMIC_ACQUIRE);
             if(!sync(DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ)) { ++history_io_errors_;return false; }
-            if(first!=last) { ++history_interference_;continue; }
+            // History spans 80 independent completed records. The current
+            // publication index may advance while an older selected record
+            // stays unchanged; it is not a generation for the whole ring.
             if(decoded!=pose_output::DecodeStatus::ok) { ++history_unavailable_;return false; }
             const auto *copy=snapshot.data()+pose_output::header_bytes+selected.published_index*spec_.element;
             if(!std::equal(confirm.begin(),confirm.end(),copy)) { ++history_interference_;continue; }
